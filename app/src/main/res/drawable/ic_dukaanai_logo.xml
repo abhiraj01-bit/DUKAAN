@@ -1,0 +1,56 @@
+﻿<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="120dp"
+    android:height="120dp"
+    android:viewportWidth="120"
+    android:viewportHeight="120">
+    <!-- Background rounded squircle -->
+    <path
+        android:fillColor="#174D36"
+        android:pathData="M30,10 L90,10 A20,20 0 0,1 110,30 L110,90 A20,20 0 0,1 90,110 L30,110 A20,20 0 0,1 10,90 L10,30 A20,20 0 0,1 30,10 Z" />
+    
+    <!-- Store Awning Canopy Base -->
+    <path
+        android:fillColor="#F3A342"
+        android:pathData="M26,38 L94,38 L94,48 L26,48 Z" />
+    
+    <!-- Awning stripes -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M26,38 L38,38 L35,54 C33,56 28,56 26,54 Z" />
+    <path
+        android:fillColor="#F3A342"
+        android:pathData="M38,38 L50,38 L49,54 C47,56 41,56 39,54 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M50,38 L62,38 L61,54 C59,56 53,56 51,54 Z" />
+    <path
+        android:fillColor="#F3A342"
+        android:pathData="M62,38 L74,38 L73,54 C71,56 65,56 63,54 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M74,38 L86,38 L85,54 C83,56 77,56 75,54 Z" />
+    <path
+        android:fillColor="#F3A342"
+        android:pathData="M86,38 L94,38 L94,54 C92,56 88,56 86,54 Z" />
+
+    <!-- Store Pillars & Counter -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M32,54 L38,54 L38,88 L32,88 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M82,54 L88,54 L88,88 L82,88 Z" />
+    
+    <!-- Counter table -->
+    <path
+        android:fillColor="#F3A342"
+        android:pathData="M28,82 L92,82 A4,4 0 0,1 96,86 L96,90 L24,90 L24,86 A4,4 0 0,1 28,82 Z" />
+    
+    <!-- Rupee / AI Symbol in center -->
+    <path
+        android:fillColor="#FAF6EC"
+        android:pathData="M52,60 L68,60 M52,66 L68,66 M52,60 L52,72 C56,72 63,72 63,66 C63,60 56,60 52,60 M57,72 L67,82"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round" />
+</vector>

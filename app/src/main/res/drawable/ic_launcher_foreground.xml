@@ -1,0 +1,32 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:scaleX="0.6"
+        android:scaleY="0.6"
+        android:translateX="22"
+        android:translateY="20">
+        <!-- Store Awning -->
+        <path android:fillColor="#F3A342" android:pathData="M16,28 L92,28 L92,38 L16,38 Z" />
+        <path android:fillColor="#FFFFFF" android:pathData="M16,28 L30,28 L27,46 C25,48 18,48 16,46 Z" />
+        <path android:fillColor="#F3A342" android:pathData="M30,28 L44,28 L43,46 C41,48 33,48 31,46 Z" />
+        <path android:fillColor="#FFFFFF" android:pathData="M44,28 L58,28 L57,46 C55,48 47,48 45,46 Z" />
+        <path android:fillColor="#F3A342" android:pathData="M58,28 L72,28 L71,46 C69,48 61,48 59,46 Z" />
+        <path android:fillColor="#FFFFFF" android:pathData="M72,28 L86,28 L85,46 C83,48 75,48 73,46 Z" />
+        <path android:fillColor="#F3A342" android:pathData="M86,28 L92,28 L92,46 C90,48 87,48 86,46 Z" />
+        <!-- Pillars -->
+        <path android:fillColor="#FFFFFF" android:pathData="M24,46 L30,46 L30,78 L24,78 Z" />
+        <path android:fillColor="#FFFFFF" android:pathData="M78,46 L84,46 L84,78 L78,78 Z" />
+        <!-- Counter -->
+        <path android:fillColor="#F3A342" android:pathData="M18,74 L90,74 A4,4 0 0,1 94,78 L94,84 L14,84 L14,78 A4,4 0 0,1 18,74 Z" />
+        <!-- Rupee Symbol -->
+        <path
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="4"
+            android:strokeLineCap="round"
+            android:pathData="M44,52 L64,52 M44,58 L64,58 M44,52 L44,66 C50,66 58,66 58,59 C58,52 50,52 44,52 M51,66 L62,76" />
+    </group>
+</vector>
