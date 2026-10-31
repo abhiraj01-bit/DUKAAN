@@ -23,6 +23,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -32,39 +33,44 @@ import com.dukaan.app.core.designsystem.theme.*
 import com.dukaan.app.core.navigation.Screen
 import com.dukaan.app.core.util.CurrencyFormatter
 import com.dukaan.app.core.util.DateFormatter
+import com.dukaan.app.core.util.UuidGenerator
 import com.dukaan.app.domain.model.Invoice
 import com.dukaan.app.domain.repository.InvoiceRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
-// ── Scan processing states ──────────────────────────────────────────────────
+// ── State Model (Phase 11) ──────────────────────────────────────────────────
 
-enum class ScanStage {
-    IDLE,
-    IMAGE_PROCESSING,
-    API_REQUEST_IN_PROGRESS,
-    RESPONSE_RECEIVED,
-    PARSING_RESPONSE,
-    SUCCESS,
-    API_ERROR,
-    INVALID_RESPONSE,
-    NETWORK_ERROR,
-    NO_API_KEY,
-    OCR_FALLBACK,
-    OCR_EMPTY
+sealed interface InvoiceScannerState {
+    object Idle : InvoiceScannerState
+    data class ImageSelected(val uri: String) : InvoiceScannerState
+    object ProcessingImage : InvoiceScannerState
+    data class SendingToGemini(val modelName: String, val attemptNumber: Int = 1) : InvoiceScannerState
+    data class Retrying(val modelName: String, val retryNumber: Int) : InvoiceScannerState
+    data class SwitchingModel(val previousModel: String, val newModel: String) : InvoiceScannerState
+    object ExtractingData : InvoiceScannerState
+    data class Success(val invoice: Invoice, val modelUsed: String) : InvoiceScannerState
+    data class Error(
+        val error: GeminiError,
+        val canRetry: Boolean,
+        val canUseOfflineOcr: Boolean,
+        val rawOcrText: String? = null,
+        val imagePath: String? = null
+    ) : InvoiceScannerState
 }
 
 data class ScannerUiState(
-    val stage: ScanStage = ScanStage.IDLE,
-    val errorMessage: String? = null,
+    val scannerState: InvoiceScannerState = InvoiceScannerState.Idle,
     val pendingInvoices: List<Invoice> = emptyList(),
-    // Holds the last bitmap so Retry can re-use it
     val lastBitmap: Bitmap? = null,
-    val lastContext: Context? = null
+    val lastContext: Context? = null,
+    val lastInvoiceId: String = ""
 )
 
 @HiltViewModel
@@ -76,13 +82,17 @@ class InvoiceScannerViewModel @Inject constructor(
     private val _uiState = MutableStateFlow(ScannerUiState())
     val uiState = _uiState.asStateFlow()
 
-    // Keep for backward compat with CameraScreen which reads isProcessing
-    val isProcessing get() = _uiState.value.stage.let {
-        it == ScanStage.IMAGE_PROCESSING ||
-        it == ScanStage.API_REQUEST_IN_PROGRESS ||
-        it == ScanStage.RESPONSE_RECEIVED ||
-        it == ScanStage.PARSING_RESPONSE
-    }
+    private var scanJob: Job? = null
+
+    val isProcessing: Boolean
+        get() = when (_uiState.value.scannerState) {
+            is InvoiceScannerState.ProcessingImage,
+            is InvoiceScannerState.SendingToGemini,
+            is InvoiceScannerState.Retrying,
+            is InvoiceScannerState.SwitchingModel,
+            is InvoiceScannerState.ExtractingData -> true
+            else -> false
+        }
 
     init {
         viewModelScope.launch {
@@ -92,127 +102,201 @@ class InvoiceScannerViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Entry point for camera captures. Cancels any ongoing scan to prevent duplicate calls.
+     */
     fun processCapturedBitmap(bitmap: Bitmap, context: Context, onReady: (String) -> Unit) {
-        _uiState.update { it.copy(lastBitmap = bitmap, lastContext = context) }
-        doScan(bitmap, context, onReady)
+        val invoiceId = UuidGenerator.generate()
+        _uiState.update {
+            it.copy(
+                lastBitmap = bitmap,
+                lastContext = context,
+                lastInvoiceId = invoiceId
+            )
+        }
+        startScan(bitmap, context, invoiceId, onReady)
     }
 
+    /**
+     * Entry point for gallery images. Safely decodes uri with bounds checking.
+     */
     fun processGalleryImage(uri: Uri, context: Context, onReady: (String) -> Unit) {
-        viewModelScope.launch {
-            _uiState.update { it.copy(stage = ScanStage.IMAGE_PROCESSING, errorMessage = null) }
+        scanJob?.cancel()
+        scanJob = viewModelScope.launch {
+            _uiState.update { it.copy(scannerState = InvoiceScannerState.ProcessingImage) }
+            val invoiceId = UuidGenerator.generate()
+
             val bitmap = try {
-                context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
+                context.contentResolver.openInputStream(uri)?.use { stream ->
+                    BitmapFactory.decodeStream(stream)
+                }
+            } catch (oom: OutOfMemoryError) {
+                _uiState.update {
+                    it.copy(
+                        scannerState = InvoiceScannerState.Error(
+                            error = GeminiError.ImageTooLarge(),
+                            canRetry = false,
+                            canUseOfflineOcr = false
+                        )
+                    )
+                }
+                return@launch
             } catch (e: Exception) {
-                _uiState.update { it.copy(stage = ScanStage.NETWORK_ERROR, errorMessage = "Could not read image: ${e.message}") }
+                _uiState.update {
+                    it.copy(
+                        scannerState = InvoiceScannerState.Error(
+                            error = GeminiError.InvalidImage(e.localizedMessage ?: "Failed to open image"),
+                            canRetry = false,
+                            canUseOfflineOcr = false
+                        )
+                    )
+                }
                 return@launch
             }
+
             if (bitmap == null) {
-                _uiState.update { it.copy(stage = ScanStage.INVALID_RESPONSE, errorMessage = "Could not decode selected image") }
+                _uiState.update {
+                    it.copy(
+                        scannerState = InvoiceScannerState.Error(
+                            error = GeminiError.InvalidImage("Could not decode selected image file"),
+                            canRetry = false,
+                            canUseOfflineOcr = false
+                        )
+                    )
+                }
                 return@launch
             }
-            _uiState.update { it.copy(lastBitmap = bitmap, lastContext = context) }
-            doScan(bitmap, context, onReady)
+
+            _uiState.update {
+                it.copy(
+                    lastBitmap = bitmap,
+                    lastContext = context,
+                    lastInvoiceId = invoiceId
+                )
+            }
+            startScan(bitmap, context, invoiceId, onReady)
         }
     }
 
+    /**
+     * Retries scanning the last captured invoice image with Gemini.
+     */
     fun retry(onReady: (String) -> Unit) {
         val bitmap = _uiState.value.lastBitmap ?: return
         val context = _uiState.value.lastContext ?: return
-        doScan(bitmap, context, onReady)
+        val invoiceId = _uiState.value.lastInvoiceId.ifBlank { UuidGenerator.generate() }
+        startScan(bitmap, context, invoiceId, onReady)
+    }
+
+    /**
+     * Uses local on-device OCR results when Gemini fails or is offline.
+     */
+    fun useOfflineOcr(onReady: (String) -> Unit) {
+        val errorState = _uiState.value.scannerState as? InvoiceScannerState.Error ?: return
+        val ocrText = errorState.rawOcrText ?: ""
+        val imagePath = errorState.imagePath ?: ""
+        val invoiceId = _uiState.value.lastInvoiceId.ifBlank { UuidGenerator.generate() }
+
+        viewModelScope.launch {
+            val invoice = geminiInvoiceService.createInvoiceFromOcr(ocrText, invoiceId, imagePath)
+            invoiceRepository.saveInvoice(invoice)
+            _uiState.update { it.copy(scannerState = InvoiceScannerState.Idle) }
+            onReady(invoice.id)
+        }
+    }
+
+    /**
+     * Creates a blank invoice for the user to manually enter items.
+     */
+    fun enterManually(onReady: (String) -> Unit) {
+        val errorState = _uiState.value.scannerState as? InvoiceScannerState.Error
+        val imagePath = errorState?.imagePath ?: ""
+        val invoiceId = _uiState.value.lastInvoiceId.ifBlank { UuidGenerator.generate() }
+
+        viewModelScope.launch {
+            val blankInvoice = geminiInvoiceService.createBlankManualInvoice(invoiceId, imagePath)
+            invoiceRepository.saveInvoice(blankInvoice)
+            _uiState.update { it.copy(scannerState = InvoiceScannerState.Idle) }
+            onReady(invoiceId)
+        }
+    }
+
+    fun cancelScan() {
+        scanJob?.cancel()
+        _uiState.update { it.copy(scannerState = InvoiceScannerState.Idle) }
     }
 
     fun resetError() {
-        _uiState.update { it.copy(stage = ScanStage.IDLE, errorMessage = null) }
+        _uiState.update { it.copy(scannerState = InvoiceScannerState.Idle) }
     }
 
-    private fun doScan(bitmap: Bitmap, context: Context, onReady: (String) -> Unit) {
-        viewModelScope.launch {
-            _uiState.update { it.copy(stage = ScanStage.API_REQUEST_IN_PROGRESS, errorMessage = null) }
+    private fun startScan(
+        bitmap: Bitmap,
+        context: Context,
+        invoiceId: String,
+        onReady: (String) -> Unit
+    ) {
+        scanJob?.cancel()
+        scanJob = viewModelScope.launch {
+            _uiState.update { it.copy(scannerState = InvoiceScannerState.ProcessingImage) }
 
-            val result = geminiInvoiceService.processInvoiceImage(context, bitmap)
-
-            _uiState.update { it.copy(stage = ScanStage.RESPONSE_RECEIVED) }
-
-            when (result) {
-                is ScanResult.Success -> {
-                    _uiState.update { it.copy(stage = ScanStage.PARSING_RESPONSE) }
-                    invoiceRepository.saveInvoice(result.invoice)
-                    _uiState.update { it.copy(stage = ScanStage.SUCCESS, errorMessage = null) }
-                    onReady(result.invoice.id)
-                }
-
-                is ScanResult.OcrFallback -> {
-                    // Gemini failed but ML Kit got some text — save what we have, let user edit
-                    invoiceRepository.saveInvoice(result.invoice)
-                    _uiState.update {
-                        it.copy(
-                            stage = ScanStage.OCR_FALLBACK,
-                            errorMessage = "AI scan unavailable. Showing on-device OCR results — please review and correct."
-                        )
+            try {
+                val result = geminiInvoiceService.processInvoiceImage(
+                    context = context,
+                    bitmap = bitmap,
+                    invoiceId = invoiceId,
+                    onStateUpdate = { state ->
+                        _uiState.update { it.copy(scannerState = state) }
                     }
-                    onReady(result.invoice.id)
-                }
+                )
 
-                is ScanResult.OcrEmpty -> {
-                    // Nothing extracted at all — navigate to a blank review screen so user can type manually
-                    val now = System.currentTimeMillis()
-                    val blankInvoice = com.dukaan.app.domain.model.Invoice(
-                        id = result.invoiceId,
-                        invoiceNumber = "",
-                        supplierName = "",
-                        invoiceDate = now,
-                        grandTotalPaise = 0L,
-                        subtotalPaise = 0L,
-                        status = com.dukaan.app.domain.model.InvoiceStatus.DRAFT,
-                        imagePath = result.imagePath,
-                        rawOcrText = "",
-                        items = emptyList(),
-                        scannedAt = now,
-                        createdAt = now,
-                        updatedAt = now
+                when (result) {
+                    is ScanResult.Success -> {
+                        invoiceRepository.saveInvoice(result.invoice)
+                        _uiState.update {
+                            it.copy(scannerState = InvoiceScannerState.Success(result.invoice, result.modelUsed))
+                        }
+                        onReady(result.invoice.id)
+                    }
+
+                    is ScanResult.Failure -> {
+                        _uiState.update {
+                            it.copy(
+                                scannerState = InvoiceScannerState.Error(
+                                    error = result.error,
+                                    canRetry = result.error.canRetry,
+                                    canUseOfflineOcr = result.rawOcrText.isNotBlank(),
+                                    rawOcrText = result.rawOcrText,
+                                    imagePath = result.imagePath
+                                )
+                            )
+                        }
+                    }
+
+                    is ScanResult.LocalOcrSuccess -> {
+                        invoiceRepository.saveInvoice(result.invoice)
+                        onReady(result.invoice.id)
+                    }
+                }
+            } catch (ce: CancellationException) {
+                // Respect coroutine cancellation
+                _uiState.update { it.copy(scannerState = InvoiceScannerState.Idle) }
+            } catch (t: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        scannerState = InvoiceScannerState.Error(
+                            error = GeminiError.Unknown(t.localizedMessage ?: "Unexpected error"),
+                            canRetry = true,
+                            canUseOfflineOcr = false
+                        )
                     )
-                    invoiceRepository.saveInvoice(blankInvoice)
-                    _uiState.update {
-                        it.copy(
-                            stage = ScanStage.OCR_EMPTY,
-                            errorMessage = "Could not extract text from this image. Please enter invoice details manually."
-                        )
-                    }
-                    onReady(result.invoiceId)
-                }
-
-                is ScanResult.NoApiKey -> {
-                    _uiState.update {
-                        it.copy(
-                            stage = ScanStage.NO_API_KEY,
-                            errorMessage = "Gemini API key not configured. Go to Settings → AI Bill Scanner to add your key."
-                        )
-                    }
-                }
-
-                is ScanResult.ApiError -> {
-                    _uiState.update {
-                        it.copy(stage = ScanStage.API_ERROR, errorMessage = result.message)
-                    }
-                }
-
-                is ScanResult.NetworkError -> {
-                    _uiState.update {
-                        it.copy(stage = ScanStage.NETWORK_ERROR, errorMessage = result.message)
-                    }
-                }
-
-                is ScanResult.ParseError -> {
-                    _uiState.update {
-                        it.copy(stage = ScanStage.INVALID_RESPONSE, errorMessage = "Could not parse AI response: ${result.message}")
-                    }
                 }
             }
         }
     }
 }
 
-// ── Scanner Screen ──────────────────────────────────────────────────────────
+// ── Scanner UI ──────────────────────────────────────────────────────────────
 
 @Composable
 fun InvoiceScannerScreen(
@@ -232,19 +316,8 @@ fun InvoiceScannerScreen(
         }
     }
 
-    val isProcessing = uiState.stage in listOf(
-        ScanStage.IMAGE_PROCESSING,
-        ScanStage.API_REQUEST_IN_PROGRESS,
-        ScanStage.RESPONSE_RECEIVED,
-        ScanStage.PARSING_RESPONSE
-    )
-
-    val hasError = uiState.stage in listOf(
-        ScanStage.API_ERROR,
-        ScanStage.NETWORK_ERROR,
-        ScanStage.INVALID_RESPONSE,
-        ScanStage.NO_API_KEY
-    )
+    val isProcessing = viewModel.isProcessing
+    val errorState = uiState.scannerState as? InvoiceScannerState.Error
 
     Scaffold(
         topBar = { DukaanTopBar(title = "Invoice Scanner") },
@@ -258,56 +331,31 @@ fun InvoiceScannerScreen(
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                // Error / status banner
-                if (hasError && uiState.errorMessage != null) {
+                // Error card with complete options (Phase 12)
+                if (errorState != null) {
                     item {
-                        ScanErrorBanner(
-                            message = uiState.errorMessage!!,
-                            stage = uiState.stage,
-                            canRetry = uiState.lastBitmap != null &&
-                                uiState.stage != ScanStage.NO_API_KEY,
+                        ScanErrorCard(
+                            error = errorState.error,
+                            canRetry = errorState.canRetry,
+                            canUseOfflineOcr = errorState.canUseOfflineOcr,
                             onRetry = {
                                 viewModel.retry { invoiceId ->
+                                    navController.navigate(Screen.ExtractedInvoicePreview.createRoute(invoiceId))
+                                }
+                            },
+                            onUseOfflineOcr = {
+                                viewModel.useOfflineOcr { invoiceId ->
+                                    navController.navigate(Screen.ExtractedInvoicePreview.createRoute(invoiceId))
+                                }
+                            },
+                            onEnterManually = {
+                                viewModel.enterManually { invoiceId ->
                                     navController.navigate(Screen.ExtractedInvoicePreview.createRoute(invoiceId))
                                 }
                             },
                             onDismiss = { viewModel.resetError() },
                             onGoToSettings = { navController.navigate(Screen.Settings.route) }
                         )
-                    }
-                }
-
-                // OCR fallback info banner (non-blocking)
-                if (uiState.stage == ScanStage.OCR_FALLBACK && uiState.errorMessage != null) {
-                    item {
-                        Card(
-                            colors = CardDefaults.cardColors(containerColor = LightOrangeSurface),
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Row(modifier = Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Icon(Icons.Default.Info, contentDescription = null, tint = SaffronOrange)
-                                Spacer(modifier = Modifier.width(10.dp))
-                                Text(uiState.errorMessage!!, style = MaterialTheme.typography.bodySmall, color = PrimaryText)
-                            }
-                        }
-                    }
-                }
-
-                // OCR empty info banner
-                if (uiState.stage == ScanStage.OCR_EMPTY && uiState.errorMessage != null) {
-                    item {
-                        Card(
-                            colors = CardDefaults.cardColors(containerColor = LightOrangeSurface),
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Row(modifier = Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Icon(Icons.Default.WarningAmber, contentDescription = null, tint = SaffronOrange)
-                                Spacer(modifier = Modifier.width(10.dp))
-                                Text(uiState.errorMessage!!, style = MaterialTheme.typography.bodySmall, color = PrimaryText)
-                            }
-                        }
                     }
                 }
 
@@ -387,7 +435,7 @@ fun InvoiceScannerScreen(
                             ) {
                                 Column {
                                     Text(
-                                        inv.supplierName.ifBlank { "Unknown Supplier" },
+                                        inv.supplierName.ifBlank { "Unassigned Supplier" },
                                         fontWeight = FontWeight.Bold,
                                         color = PrimaryText
                                     )
@@ -408,7 +456,7 @@ fun InvoiceScannerScreen(
                 }
             }
 
-            // Processing overlay
+            // Processing overlay with informative status messages
             if (isProcessing) {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
@@ -427,21 +475,28 @@ fun InvoiceScannerScreen(
                             ) {
                                 CircularProgressIndicator(color = ForestGreen, strokeWidth = 3.dp)
                                 Text(
-                                    when (uiState.stage) {
-                                        ScanStage.IMAGE_PROCESSING -> "Preparing image..."
-                                        ScanStage.API_REQUEST_IN_PROGRESS -> "Sending to Gemini AI..."
-                                        ScanStage.RESPONSE_RECEIVED -> "Response received..."
-                                        ScanStage.PARSING_RESPONSE -> "Parsing invoice data..."
-                                        else -> "Processing..."
+                                    text = when (val state = uiState.scannerState) {
+                                        is InvoiceScannerState.ProcessingImage -> "Reading your invoice..."
+                                        is InvoiceScannerState.SendingToGemini -> "Connecting to AI (${state.modelName})..."
+                                        is InvoiceScannerState.Retrying -> "Retrying connection (attempt ${state.retryNumber})..."
+                                        is InvoiceScannerState.SwitchingModel -> "Trying another available model..."
+                                        is InvoiceScannerState.ExtractingData -> "Extracting product details..."
+                                        else -> "Almost done..."
                                     },
                                     fontWeight = FontWeight.Bold,
-                                    color = PrimaryText
+                                    fontSize = 17.sp,
+                                    color = PrimaryText,
+                                    textAlign = TextAlign.Center
                                 )
                                 Text(
-                                    "Extracting items, rates & totals",
+                                    "Extracting items, quantities & prices",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = SecondaryText
                                 )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                TextButton(onClick = viewModel::cancelScan) {
+                                    Text("Cancel", color = SecondaryText)
+                                }
                             }
                         }
                     }
@@ -452,11 +507,13 @@ fun InvoiceScannerScreen(
 }
 
 @Composable
-private fun ScanErrorBanner(
-    message: String,
-    stage: ScanStage,
+fun ScanErrorCard(
+    error: GeminiError,
     canRetry: Boolean,
+    canUseOfflineOcr: Boolean,
     onRetry: () -> Unit,
+    onUseOfflineOcr: () -> Unit,
+    onEnterManually: () -> Unit,
     onDismiss: () -> Unit,
     onGoToSettings: () -> Unit
 ) {
@@ -467,40 +524,79 @@ private fun ScanErrorBanner(
     ) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.ErrorOutline, contentDescription = null, tint = ErrorRed, modifier = Modifier.size(22.dp))
+                Icon(Icons.Default.ErrorOutline, contentDescription = null, tint = ErrorRed, modifier = Modifier.size(24.dp))
                 Spacer(modifier = Modifier.width(10.dp))
                 Text(
-                    when (stage) {
-                        ScanStage.NO_API_KEY -> "API Key Required"
-                        ScanStage.API_ERROR -> "Gemini API Error"
-                        ScanStage.NETWORK_ERROR -> "Network Error"
-                        ScanStage.INVALID_RESPONSE -> "Invalid Response"
-                        else -> "Scan Failed"
+                    text = when (error) {
+                        is GeminiError.NoApiKey -> "API Key Required"
+                        is GeminiError.InvalidApiKey -> "Authentication Failed"
+                        is GeminiError.PermissionDenied -> "Permission Denied"
+                        is GeminiError.ModelNotFound -> "Model Unavailable"
+                        is GeminiError.QuotaExceeded -> "Quota Limit Reached"
+                        is GeminiError.RateLimited -> "Rate Limit"
+                        is GeminiError.ServerError -> "AI Server Unavailable"
+                        is GeminiError.NetworkError -> "Network Disconnected"
+                        is GeminiError.Timeout -> "Request Timeout"
+                        is GeminiError.ContentBlocked -> "Content Flagged"
+                        else -> "Invoice Scan Incomplete"
                     },
-                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                     color = ErrorRed
                 )
             }
-            Text(message, style = MaterialTheme.typography.bodySmall, color = PrimaryText)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (stage == ScanStage.NO_API_KEY) {
+
+            Text(
+                text = error.userMessage,
+                style = MaterialTheme.typography.bodyMedium,
+                color = PrimaryText
+            )
+
+            // Action Buttons (Phase 12)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (error is GeminiError.NoApiKey || error is GeminiError.InvalidApiKey || error is GeminiError.ModelNotFound) {
                     Button(
                         onClick = onGoToSettings,
                         colors = ButtonDefaults.buttonColors(containerColor = ForestGreen),
-                        shape = RoundedCornerShape(8.dp),
-                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp)
-                    ) { Text("Go to Settings", style = MaterialTheme.typography.labelMedium) }
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text("Configure Settings", style = MaterialTheme.typography.labelMedium)
+                    }
                 }
+
                 if (canRetry) {
                     Button(
                         onClick = onRetry,
-                        colors = ButtonDefaults.buttonColors(containerColor = SaffronOrange),
-                        shape = RoundedCornerShape(8.dp),
-                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp)
-                    ) { Text("Retry", style = MaterialTheme.typography.labelMedium) }
+                        colors = ButtonDefaults.buttonColors(containerColor = ForestGreen),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text("Try Again", style = MaterialTheme.typography.labelMedium)
+                    }
                 }
+
+                if (canUseOfflineOcr) {
+                    OutlinedButton(
+                        onClick = onUseOfflineOcr,
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text("Use Offline OCR", style = MaterialTheme.typography.labelMedium, color = ForestGreen)
+                    }
+                }
+
+                OutlinedButton(
+                    onClick = onEnterManually,
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("Manual Entry", style = MaterialTheme.typography.labelMedium, color = PrimaryText)
+                }
+            }
+
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                 TextButton(onClick = onDismiss) {
-                    Text("Dismiss", style = MaterialTheme.typography.labelMedium, color = SecondaryText)
+                    Text("Dismiss", color = SecondaryText)
                 }
             }
         }

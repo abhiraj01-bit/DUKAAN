@@ -27,6 +27,13 @@ class DatabaseSeeder @Inject constructor(
      */
     suspend fun seedIfEmpty() = withContext(Dispatchers.IO) {
         // Clean out any legacy mock shop profile with "Sharma General Store"
+        // Clean legacy mock invoices from any previous test runs
+        val legacyMockInvoices = listOf("inv_1128", "inv_882", "inv_512", "inv_104")
+        for (legacyId in legacyMockInvoices) {
+            invoiceDao.deleteById(legacyId)
+            invoiceItemDao.deleteByInvoiceId(legacyId)
+        }
+
         val existingShop = shopProfileDao.getShopProfileOnce()
         if (existingShop?.shopName == "Sharma General Store") {
             shopProfileDao.deleteAll()
@@ -243,92 +250,12 @@ class DatabaseSeeder @Inject constructor(
         )
         khataList.forEach { khataDao.insert(it) }
 
-        // 6. Invoices in Vault
-        val inv1 = InvoiceEntity(
-            id = "inv_1128",
-            invoiceNumber = "1128",
-            supplierName = "Sharma Traders",
-            invoiceDate = now - (dayMs * 5),
-            grandTotalPaise = 418000L,
-            subtotalPaise = 418000L,
-            status = "CONFIRMED",
-            createdAt = now - (dayMs * 5),
-            confirmedAt = now - (dayMs * 5)
-        )
-        invoiceDao.insertOrUpdate(inv1)
-        invoiceItemDao.insertAll(
-            listOf(
-                InvoiceItemEntity(
-                    id = "ii_1",
-                    invoiceId = "inv_1128",
-                    productId = "p_atta",
-                    productName = "Aashirvaad Atta",
-                    quantity = 10.0,
-                    purchasePricePaise = 32000L,
-                    lineTotalPaise = 320000L
-                ),
-                InvoiceItemEntity(
-                    id = "ii_2",
-                    invoiceId = "inv_1128",
-                    productId = "p_oil",
-                    productName = "Fortune Oil",
-                    quantity = 5.0,
-                    purchasePricePaise = 18000L,
-                    lineTotalPaise = 90000L
-                ),
-                InvoiceItemEntity(
-                    id = "ii_3",
-                    invoiceId = "inv_1128",
-                    productId = "p_salt",
-                    productName = "Tata Salt",
-                    quantity = 4.0,
-                    purchasePricePaise = 2000L,
-                    lineTotalPaise = 8000L
-                )
-            )
-        )
-
-        invoiceDao.insertOrUpdate(
-            InvoiceEntity(
-                id = "inv_882",
-                invoiceNumber = "882",
-                supplierName = "Gupta Distributors",
-                invoiceDate = now - (dayMs * 9),
-                grandTotalPaise = 245000L,
-                subtotalPaise = 245000L,
-                status = "CONFIRMED",
-                createdAt = now - (dayMs * 9),
-                confirmedAt = now - (dayMs * 9)
-            )
-        )
-
-        invoiceDao.insertOrUpdate(
-            InvoiceEntity(
-                id = "inv_512",
-                invoiceNumber = "512",
-                supplierName = "Ravi Kirana",
-                invoiceDate = now - (dayMs * 13),
-                grandTotalPaise = 132000L,
-                subtotalPaise = 132000L,
-                status = "DRAFT",
-                createdAt = now - (dayMs * 13)
-            )
-        )
-
-        invoiceDao.insertOrUpdate(
-            InvoiceEntity(
-                id = "inv_104",
-                invoiceNumber = "104",
-                supplierName = "Aggarwal Wholesale",
-                invoiceDate = now - (dayMs * 16),
-                grandTotalPaise = 560000L,
-                subtotalPaise = 560000L,
-                status = "CONFIRMED",
-                createdAt = now - (dayMs * 16),
-                confirmedAt = now - (dayMs * 16)
-            )
-        )
-
+        // Invoices are NOT seeded with sample data - only real scanned invoices are stored
+        val legacyInvoiceIds = listOf("inv_1128", "inv_882", "inv_512", "inv_104")
+        for (id in legacyInvoiceIds) {
+            invoiceDao.deleteById(id)
+            invoiceItemDao.deleteByInvoiceId(id)
+        }
         // 7. Sales (Today: ₹12,450; Month: ₹1,24,500; Expenses: ₹90,300; Profit: ₹34,200)
         val todaySale = SaleEntity(
             id = "s_today_1",

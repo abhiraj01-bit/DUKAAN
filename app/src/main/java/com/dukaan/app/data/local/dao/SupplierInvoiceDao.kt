@@ -53,6 +53,9 @@ interface InvoiceDao {
 
     @Query("UPDATE invoices SET status = :status, confirmed_at = :confirmedAt, updated_at = :now WHERE id = :id")
     suspend fun updateStatus(id: String, status: String, confirmedAt: Long? = null, now: Long = System.currentTimeMillis())
+
+    @Query("DELETE FROM invoices WHERE id = :id")
+    suspend fun deleteById(id: String)
 }
 
 @Dao

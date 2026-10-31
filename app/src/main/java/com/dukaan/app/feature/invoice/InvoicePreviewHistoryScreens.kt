@@ -88,6 +88,9 @@ fun ExtractedInvoicePreviewScreen(
     }
 
     var showAddItemDialog by remember { mutableStateOf(false) }
+    var showEditDetailsDialog by remember { mutableStateOf(false) }
+    var editSupplierName by remember { mutableStateOf("") }
+    var editInvoiceNumber by remember { mutableStateOf("") }
     var newItemName by remember { mutableStateOf("") }
     var newItemQty by remember { mutableStateOf("") }
     var newItemPrice by remember { mutableStateOf("") }
@@ -204,11 +207,43 @@ fun ExtractedInvoicePreviewScreen(
                                     color = if (state.supplierName.isNotBlank()) PrimaryText else SecondaryText
                                 )
                             }
-                            Text(
-                                text = "Change",
-                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
-                                color = Color(0xFF1E88E5)
-                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                val isAiProcessed = state.invoice?.rawOcrText?.trim()?.startsWith("{") == true
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (isAiProcessed) ForestGreen.copy(alpha = 0.12f) else SaffronOrange.copy(alpha = 0.12f)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            if (isAiProcessed) Icons.Default.AutoAwesome else Icons.Default.DocumentScanner,
+                                            contentDescription = null,
+                                            tint = if (isAiProcessed) ForestGreen else SaffronOrange,
+                                            modifier = Modifier.size(13.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(
+                                            text = if (isAiProcessed) "AI Scanned" else "On-Device OCR",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (isAiProcessed) ForestGreen else SaffronOrange,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                }
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Text(
+                                    text = "Change",
+                                    modifier = Modifier.clickable {
+                                        editSupplierName = state.supplierName
+                                        editInvoiceNumber = state.invoiceNumber
+                                        showEditDetailsDialog = true
+                                    },
+                                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
+                                    color = Color(0xFF1E88E5)
+                                )
+                            }
                         }
 
                         HorizontalDivider(color = BorderColor)
@@ -323,6 +358,48 @@ fun ExtractedInvoicePreviewScreen(
 
             item { Spacer(modifier = Modifier.height(20.dp)) }
         }
+    }
+
+    if (showEditDetailsDialog) {
+        AlertDialog(
+            onDismissRequest = { showEditDetailsDialog = false },
+            title = { Text("Edit Invoice Details", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(
+                        value = editSupplierName,
+                        onValueChange = { editSupplierName = it },
+                        label = { Text("Supplier Name") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = editInvoiceNumber,
+                        onValueChange = { editInvoiceNumber = it },
+                        label = { Text("Invoice Number") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        viewModel.onSupplierNameChange(editSupplierName.trim())
+                        viewModel.onInvoiceNumberChange(editInvoiceNumber.trim())
+                        showEditDetailsDialog = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = ForestGreen)
+                ) {
+                    Text("Save")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEditDetailsDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 
     if (showAddItemDialog) {

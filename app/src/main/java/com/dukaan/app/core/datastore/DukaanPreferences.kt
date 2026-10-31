@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
+import com.dukaan.app.core.security.KeystoreHelper
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -33,6 +34,11 @@ class DukaanPreferences @Inject constructor(
         val KEY_DEFAULT_TAX_PERCENT = intPreferencesKey("default_tax_percent")
         val KEY_GEMINI_API_KEY = stringPreferencesKey("gemini_api_key")
         val KEY_GEMINI_MODEL = stringPreferencesKey("gemini_model")
+        val KEY_GEMINI_FALLBACK_ENABLED = booleanPreferencesKey("gemini_fallback_enabled")
+        val KEY_LAST_USED_MODEL = stringPreferencesKey("last_used_model")
+        val KEY_LAST_SCAN_STATUS = stringPreferencesKey("last_scan_status")
+        val KEY_LAST_SCAN_DURATION_MS = longPreferencesKey("last_scan_duration_ms")
+        val KEY_LAST_SCAN_ERROR = stringPreferencesKey("last_scan_error")
         val KEY_APP_PIN = stringPreferencesKey("app_pin")
     }
 
@@ -46,18 +52,56 @@ class DukaanPreferences @Inject constructor(
 
     val geminiApiKey: Flow<String> = dataStore.data
         .catch { if (it is IOException) emit(emptyPreferences()) else throw it }
-        .map { it[KEY_GEMINI_API_KEY] ?: "" }
+        .map { prefs ->
+            val stored = prefs[KEY_GEMINI_API_KEY] ?: ""
+            KeystoreHelper.decrypt(stored)
+        }
 
     val geminiModel: Flow<String> = dataStore.data
         .catch { if (it is IOException) emit(emptyPreferences()) else throw it }
         .map { it[KEY_GEMINI_MODEL] ?: "gemini-1.5-flash" }
 
+    val geminiFallbackEnabled: Flow<Boolean> = dataStore.data
+        .catch { if (it is IOException) emit(emptyPreferences()) else throw it }
+        .map { it[KEY_GEMINI_FALLBACK_ENABLED] ?: true }
+
+    val lastUsedModel: Flow<String> = dataStore.data
+        .catch { if (it is IOException) emit(emptyPreferences()) else throw it }
+        .map { it[KEY_LAST_USED_MODEL] ?: "" }
+
+    val lastScanStatus: Flow<String> = dataStore.data
+        .catch { if (it is IOException) emit(emptyPreferences()) else throw it }
+        .map { it[KEY_LAST_SCAN_STATUS] ?: "No scans yet" }
+
+    val lastScanDurationMs: Flow<Long> = dataStore.data
+        .catch { if (it is IOException) emit(emptyPreferences()) else throw it }
+        .map { it[KEY_LAST_SCAN_DURATION_MS] ?: 0L }
+
+    val lastScanError: Flow<String> = dataStore.data
+        .catch { if (it is IOException) emit(emptyPreferences()) else throw it }
+        .map { it[KEY_LAST_SCAN_ERROR] ?: "" }
+
     suspend fun setGeminiApiKey(apiKey: String) {
-        dataStore.edit { it[KEY_GEMINI_API_KEY] = apiKey }
+        dataStore.edit {
+            it[KEY_GEMINI_API_KEY] = KeystoreHelper.encrypt(apiKey)
+        }
     }
 
     suspend fun setGeminiModel(model: String) {
         dataStore.edit { it[KEY_GEMINI_MODEL] = model }
+    }
+
+    suspend fun setGeminiFallbackEnabled(enabled: Boolean) {
+        dataStore.edit { it[KEY_GEMINI_FALLBACK_ENABLED] = enabled }
+    }
+
+    suspend fun updateScanDiagnostics(modelUsed: String, status: String, durationMs: Long, error: String = "") {
+        dataStore.edit {
+            it[KEY_LAST_USED_MODEL] = modelUsed
+            it[KEY_LAST_SCAN_STATUS] = status
+            it[KEY_LAST_SCAN_DURATION_MS] = durationMs
+            it[KEY_LAST_SCAN_ERROR] = error
+        }
     }
 
     val isOnboardingDone: Flow<Boolean> = dataStore.data

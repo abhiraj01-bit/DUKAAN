@@ -98,7 +98,7 @@ fun AppNavGraph() {
             route = Screen.InvoiceReview.route,
             arguments = listOf(navArgument("invoiceId") { type = NavType.StringType })
         ) { backStackEntry ->
-            val invoiceId = backStackEntry.arguments?.getString("invoiceId") ?: "1128"
+            val invoiceId = backStackEntry.arguments?.getString("invoiceId") ?: ""
             ExtractedInvoicePreviewScreen(navController = navController, invoiceId = invoiceId)
         }
 

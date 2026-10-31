@@ -24,8 +24,8 @@ object InvoiceParser {
     )
 
     private val totalPatterns = listOf(
-        Pattern.compile("""(?:grand\s*total|net\s*amount|total\s*amount|final\s*total|total)[.:\s]*??\s*([0-9,]+(?:\.[0-9]{1,2})?)""", Pattern.CASE_INSENSITIVE),
-        Pattern.compile("""?\s*([0-9,]+(?:\.[0-9]{1,2})?)""", Pattern.CASE_INSENSITIVE)
+        Pattern.compile("""(?:grand\s*total|net\s*amount|total\s*amount|final\s*total|total)[.:\s]*(?:\u20B9|Rs\.?|INR)?\s*([0-9,]+(?:\.[0-9]{1,2})?)""", Pattern.CASE_INSENSITIVE),
+        Pattern.compile("""(?:\u20B9|Rs\.?|INR)\s*([0-9,]+(?:\.[0-9]{1,2})?)""", Pattern.CASE_INSENSITIVE)
     )
 
     private val dateFormats = listOf(
@@ -103,8 +103,7 @@ object InvoiceParser {
             }
         }
 
-        // 3. Line items heuristics
-        // Pattern: [Item Name] [Quantity] [Unit/Price] [Total]
+        // 3. Line items heuristics: [Item Name] [Quantity] [Unit/Price] [Total]
         val lineItemPattern = Pattern.compile(
             """^(.*?)\s+(\d+(?:\.\d+)?)\s*(?:pcs|kg|gm|ltr|box|pkt|bag)?\s+(?:x\s*)?(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)$""",
             Pattern.CASE_INSENSITIVE
@@ -133,8 +132,8 @@ object InvoiceParser {
         }
 
         return ParsedInvoiceData(
-            supplierName = detectedSupplier.ifBlank { "Supplier / Wholesaler" },
-            invoiceNumber = detectedInvoiceNum.ifBlank { "INV-${System.currentTimeMillis() % 100000}" },
+            supplierName = detectedSupplier.trim(),
+            invoiceNumber = detectedInvoiceNum.trim(),
             invoiceDate = detectedDate,
             items = parsedItems,
             grandTotalPaise = detectedTotalPaise,
