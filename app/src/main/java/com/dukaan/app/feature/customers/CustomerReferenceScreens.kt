@@ -37,6 +37,14 @@ import com.dukaan.app.domain.model.KhataTransaction
 import com.dukaan.app.domain.model.KhataTransactionType
 import com.dukaan.app.domain.repository.CustomerRepository
 import com.dukaan.app.domain.repository.KhataRepository
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
+import com.dukaan.app.data.local.entity.KhataSmsEntity
+import com.dukaan.app.domain.repository.KhataSmsRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -59,16 +67,30 @@ class CustomerListViewModel @Inject constructor(
     }
 }
 
+sealed interface SmsReminderUiState {
+    object Idle : SmsReminderUiState
+    object Sending : SmsReminderUiState
+    data class Success(val message: String) : SmsReminderUiState
+    data class Error(val errorMessage: String) : SmsReminderUiState
+}
+
 @HiltViewModel
 class CustomerLedgerViewModel @Inject constructor(
     private val customerRepository: CustomerRepository,
-    private val khataRepository: KhataRepository
+    private val khataRepository: KhataRepository,
+    private val khataSmsRepository: KhataSmsRepository
 ) : ViewModel() {
     private val _customer = MutableStateFlow<Customer?>(null)
     val customer = _customer.asStateFlow()
 
     private val _transactions = MutableStateFlow<List<KhataTransaction>>(emptyList())
     val transactions = _transactions.asStateFlow()
+
+    private val _smsState = MutableStateFlow<SmsReminderUiState>(SmsReminderUiState.Idle)
+    val smsState = _smsState.asStateFlow()
+
+    private val _smsHistory = MutableStateFlow<List<KhataSmsEntity>>(emptyList())
+    val smsHistory = _smsHistory.asStateFlow()
 
     fun load(customerId: String) {
         viewModelScope.launch {
@@ -81,6 +103,38 @@ class CustomerLedgerViewModel @Inject constructor(
                 _transactions.value = it
             }
         }
+        viewModelScope.launch {
+            khataSmsRepository.getSmsHistoryByCustomer(customerId).collect {
+                _smsHistory.value = it
+            }
+        }
+    }
+
+    fun sendSmsReminder(customerId: String) {
+        val cust = _customer.value ?: return
+        val phone = cust.phoneNumber?.trim() ?: ""
+        if (phone.isBlank()) {
+            _smsState.value = SmsReminderUiState.Error("Customer has no phone number on record")
+            return
+        }
+        if (cust.outstandingPaise <= 0L) {
+            _smsState.value = SmsReminderUiState.Error("Customer has zero balance (?0 udhaar)")
+            return
+        }
+
+        viewModelScope.launch {
+            _smsState.value = SmsReminderUiState.Sending
+            val result = khataSmsRepository.sendManualReminder(customerId)
+            if (result.isSuccess) {
+                _smsState.value = SmsReminderUiState.Success("SMS sent directly to  () via SIM")
+            } else {
+                _smsState.value = SmsReminderUiState.Error(result.exceptionOrNull()?.message ?: "Failed to send SMS")
+            }
+        }
+    }
+
+    fun resetSmsState() {
+        _smsState.value = SmsReminderUiState.Idle
     }
 }
 
@@ -444,6 +498,19 @@ fun ReferenceCustomerLedgerScreen(
     var selectedTab by remember { mutableStateOf("Transactions") }
     val customer by viewModel.customer.collectAsState()
     val transactions by viewModel.transactions.collectAsState()
+    val smsState by viewModel.smsState.collectAsState()
+    val smsHistory by viewModel.smsHistory.collectAsState()
+    val context = LocalContext.current
+
+    val smsPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            viewModel.sendSmsReminder(customerId)
+        } else {
+            // Permission denied
+        }
+    }
 
     LaunchedEffect(customerId) {
         viewModel.load(customerId)
@@ -484,8 +551,14 @@ fun ReferenceCustomerLedgerScreen(
                     }
                 },
                 actions = {
-                    IconButton(onClick = {}) {
-                        Icon(Icons.Default.NotificationsNone, contentDescription = "Remind", tint = PrimaryText)
+                    IconButton(onClick = {
+                        if (ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED) {
+                            viewModel.sendSmsReminder(customerId)
+                        } else {
+                            smsPermissionLauncher.launch(Manifest.permission.SEND_SMS)
+                        }
+                    }) {
+                        Icon(Icons.Default.Send, contentDescription = "Send SMS Reminder", tint = ForestGreen)
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = WarmCream)
@@ -588,6 +661,89 @@ fun ReferenceCustomerLedgerScreen(
                             ) {
                                 Text("Record Payment", fontWeight = FontWeight.Bold)
                             }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // FEATURE 1: Send SMS Reminder Button
+                        Button(
+                            onClick = {
+                                if (ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED) {
+                                    viewModel.sendSmsReminder(customerId)
+                                } else {
+                                    smsPermissionLauncher.launch(Manifest.permission.SEND_SMS)
+                                }
+                            },
+                            enabled = smsState !is SmsReminderUiState.Sending,
+                            colors = ButtonDefaults.buttonColors(containerColor = ForestGreen),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.fillMaxWidth().height(48.dp)
+                        ) {
+                            if (smsState is SmsReminderUiState.Sending) {
+                                CircularProgressIndicator(color = SurfaceWhite, strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Sending SMS from SIM...", fontWeight = FontWeight.Bold)
+                            } else {
+                                Icon(Icons.Default.Send, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Send SMS Reminder", fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        // Live SMS Feedback Banners
+                        when (val state = smsState) {
+                            is SmsReminderUiState.Success -> {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Card(
+                                    colors = CardDefaults.cardColors(containerColor = LightGreenSurface),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(Icons.Default.CheckCircle, contentDescription = null, tint = SuccessGreen, modifier = Modifier.size(18.dp))
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(state.message, style = MaterialTheme.typography.bodySmall, color = PrimaryText, modifier = Modifier.weight(1f))
+                                        IconButton(onClick = viewModel::resetSmsState, modifier = Modifier.size(20.dp)) {
+                                            Icon(Icons.Default.Close, contentDescription = "Close", tint = SecondaryText, modifier = Modifier.size(14.dp))
+                                        }
+                                    }
+                                }
+                            }
+                            is SmsReminderUiState.Error -> {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Card(
+                                    colors = CardDefaults.cardColors(containerColor = LightRedSurface),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(Icons.Default.ErrorOutline, contentDescription = null, tint = ErrorRed, modifier = Modifier.size(18.dp))
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(state.errorMessage, style = MaterialTheme.typography.bodySmall, color = PrimaryText, modifier = Modifier.weight(1f))
+                                        IconButton(onClick = viewModel::resetSmsState, modifier = Modifier.size(20.dp)) {
+                                            Icon(Icons.Default.Close, contentDescription = "Close", tint = SecondaryText, modifier = Modifier.size(14.dp))
+                                        }
+                                    }
+                                }
+                            }
+                            else -> {}
+                        }
+
+                        // Last reminder date indicator
+                        val lastSms = smsHistory.firstOrNull()
+                        if (lastSms != null) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "Last reminder:  • Status: ",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SecondaryText
+                            )
                         }
                     }
                 }

@@ -40,6 +40,10 @@ class DukaanPreferences @Inject constructor(
         val KEY_LAST_SCAN_DURATION_MS = longPreferencesKey("last_scan_duration_ms")
         val KEY_LAST_SCAN_ERROR = stringPreferencesKey("last_scan_error")
         val KEY_APP_PIN = stringPreferencesKey("app_pin")
+        val KEY_AUTO_MONTHLY_SMS = booleanPreferencesKey("auto_monthly_sms")
+        val KEY_PREFERRED_SIM_SUB_ID = intPreferencesKey("preferred_sim_sub_id")
+        val KEY_NEXT_MONTHLY_SMS_DATE = longPreferencesKey("next_monthly_sms_date")
+        val KEY_LAST_MONTHLY_SMS_RUN = longPreferencesKey("last_monthly_sms_run")
     }
 
     val appPin: Flow<String> = dataStore.data
@@ -154,6 +158,38 @@ class DukaanPreferences @Inject constructor(
 
     suspend fun setNotifDailySummary(enabled: Boolean) {
         dataStore.edit { it[KEY_NOTIF_DAILY_SUMMARY] = enabled }
+    }
+
+    val autoMonthlySms: Flow<Boolean> = dataStore.data
+        .catch { if (it is IOException) emit(emptyPreferences()) else throw it }
+        .map { it[KEY_AUTO_MONTHLY_SMS] ?: false }
+
+    val preferredSimSubId: Flow<Int> = dataStore.data
+        .catch { if (it is IOException) emit(emptyPreferences()) else throw it }
+        .map { it[KEY_PREFERRED_SIM_SUB_ID] ?: -1 }
+
+    val nextMonthlySmsDate: Flow<Long> = dataStore.data
+        .catch { if (it is IOException) emit(emptyPreferences()) else throw it }
+        .map { it[KEY_NEXT_MONTHLY_SMS_DATE] ?: 0L }
+
+    val lastMonthlySmsRun: Flow<Long> = dataStore.data
+        .catch { if (it is IOException) emit(emptyPreferences()) else throw it }
+        .map { it[KEY_LAST_MONTHLY_SMS_RUN] ?: 0L }
+
+    suspend fun setAutoMonthlySms(enabled: Boolean) {
+        dataStore.edit { it[KEY_AUTO_MONTHLY_SMS] = enabled }
+    }
+
+    suspend fun setPreferredSimSubId(subId: Int) {
+        dataStore.edit { it[KEY_PREFERRED_SIM_SUB_ID] = subId }
+    }
+
+    suspend fun setNextMonthlySmsDate(timestamp: Long) {
+        dataStore.edit { it[KEY_NEXT_MONTHLY_SMS_DATE] = timestamp }
+    }
+
+    suspend fun setLastMonthlySmsRun(timestamp: Long) {
+        dataStore.edit { it[KEY_LAST_MONTHLY_SMS_RUN] = timestamp }
     }
 
     suspend fun setLastBackupTime(time: Long) {

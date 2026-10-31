@@ -39,4 +39,5 @@ object DatabaseModule {
     @Provides fun provideSalePaymentDao(db: DukaanDatabase) = db.salePaymentDao()
     @Provides fun provideStockMovementDao(db: DukaanDatabase) = db.stockMovementDao()
     @Provides fun provideExpenseDao(db: DukaanDatabase) = db.expenseDao()
+    @Provides fun provideKhataSmsDao(db: DukaanDatabase) = db.khataSmsDao()
 }

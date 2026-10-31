@@ -21,6 +21,9 @@ interface CustomerDao {
     @Query("SELECT * FROM customers WHERE is_active = 1 AND outstanding_paise > 0 ORDER BY outstanding_paise DESC")
     fun getCustomersWithOutstanding(): Flow<List<CustomerEntity>>
 
+    @Query("SELECT * FROM customers WHERE is_active = 1 AND outstanding_paise > 0 ORDER BY outstanding_paise DESC")
+    suspend fun getCustomersWithOutstandingOnce(): List<CustomerEntity>
+
     @Query("SELECT SUM(outstanding_paise) FROM customers WHERE is_active = 1")
     fun getTotalOutstandingPaise(): Flow<Long?>
 

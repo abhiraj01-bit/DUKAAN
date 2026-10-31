@@ -19,9 +19,10 @@ import com.dukaan.app.data.local.entity.*
         SaleItemEntity::class,
         SalePaymentEntity::class,
         StockMovementEntity::class,
-        ExpenseEntity::class
+        ExpenseEntity::class,
+        KhataSmsEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class DukaanDatabase : RoomDatabase() {
@@ -38,6 +39,7 @@ abstract class DukaanDatabase : RoomDatabase() {
     abstract fun salePaymentDao(): SalePaymentDao
     abstract fun stockMovementDao(): StockMovementDao
     abstract fun expenseDao(): ExpenseDao
+    abstract fun khataSmsDao(): KhataSmsDao
 
     companion object {
         const val DATABASE_NAME = "dukaan_db"

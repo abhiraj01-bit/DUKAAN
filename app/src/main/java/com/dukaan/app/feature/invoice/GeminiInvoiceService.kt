@@ -2,22 +2,21 @@ package com.dukaan.app.feature.invoice
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.util.Base64
 import android.util.Log
 import com.dukaan.app.core.datastore.DukaanPreferences
+import com.dukaan.app.core.ocr.ExtractionSource
+import com.dukaan.app.core.ocr.OcrImageProcessor
+import com.dukaan.app.core.ocr.OcrLanguage
+import com.dukaan.app.core.ocr.OcrLanguageRouter
+import com.dukaan.app.core.ocr.OcrResult
 import com.dukaan.app.core.util.UuidGenerator
 import com.dukaan.app.domain.model.Invoice
 import com.dukaan.app.domain.model.InvoiceItem
 import com.dukaan.app.domain.model.InvoiceStatus
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import okhttp3.ConnectionPool
 import okhttp3.MediaType.Companion.toMediaType
@@ -29,12 +28,9 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.io.IOException
-import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
-import kotlin.coroutines.resume
 
 private const val TAG = "GeminiInvoiceService"
 
@@ -42,22 +38,55 @@ private const val TAG = "GeminiInvoiceService"
  * Result of the invoice processing pipeline.
  */
 sealed class ScanResult {
-    data class Success(val invoice: Invoice, val modelUsed: String) : ScanResult()
-    data class Failure(val error: GeminiError, val rawOcrText: String = "", val imagePath: String = "") : ScanResult()
-    data class LocalOcrSuccess(val invoice: Invoice, val rawOcrText: String) : ScanResult()
+    data class Success(
+        val invoice: Invoice,
+        val modelUsed: String,
+        val extractionSource: ExtractionSource = ExtractionSource.HYBRID
+    ) : ScanResult()
+
+    data class Failure(
+        val error: GeminiError,
+        val rawOcrText: String = "",
+        val imagePath: String = ""
+    ) : ScanResult()
+
+    data class LocalOcrSuccess(
+        val invoice: Invoice,
+        val rawOcrText: String,
+        val extractionSource: ExtractionSource = ExtractionSource.LOCAL_OCR
+    ) : ScanResult()
 }
 
+/**
+ * Orchestrates the hybrid OCR pipeline:
+ *
+ *  1. Save image to local storage.
+ *  2. Correct EXIF orientation.
+ *  3. Preprocess image (grayscale, contrast).
+ *  4. Run ML Kit local OCR (Latin + Devanagari, offline).
+ *  5. Detect scripts present in OCR output.
+ *  6. Parse extracted text into structured invoice.
+ *  7. If Gemini is configured AND internet available: run Gemini visual verification.
+ *  8. Merge/compare local OCR vs. Gemini output.
+ *  9. Return result with confidence and source labels.
+ *
+ * Never fabricates invoice data.
+ * Never returns fake success.
+ * Gracefully degrades to offline OCR when Gemini fails.
+ */
 @Singleton
 class GeminiInvoiceService @Inject constructor(
     private val preferences: DukaanPreferences,
-    private val modelManager: GeminiModelManager
+    private val modelManager: GeminiModelManager,
+    private val ocrLanguageRouter: OcrLanguageRouter,
+    private val ocrImageProcessor: OcrImageProcessor
 ) {
 
     private val httpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .connectionPool(ConnectionPool(5, 5, TimeUnit.MINUTES))
             .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(90, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
             .build()
@@ -65,15 +94,8 @@ class GeminiInvoiceService @Inject constructor(
 
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
-    /**
-     * Complete invoice image processing pipeline:
-     * 1. Safe image persistence & downscaling.
-     * 2. Background local OCR execution.
-     * 3. Config validation (API key, model).
-     * 4. Multi-model fallback execution with exponential backoff.
-     * 5. Robust JSON parsing.
-     * 6. Diagnostic tracking.
-     */
+    // ─── Main entry point ─────────────────────────────────────────────────
+
     suspend fun processInvoiceImage(
         context: Context,
         bitmap: Bitmap,
@@ -82,377 +104,422 @@ class GeminiInvoiceService @Inject constructor(
     ): ScanResult = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()
 
-        // 1. Memory-safe downscaling and disk persistence
+        // 1. Save original image to disk (needed as path reference)
         val imagePath = try {
             saveImageToInternalStorage(context, bitmap, invoiceId)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to save invoice image: ${e.message}")
             return@withContext ScanResult.Failure(
                 GeminiError.InvalidImage("Failed to save image: ${e.message}"),
-                "",
-                ""
+                "", ""
             )
         }
 
-        // 2. Run local ML Kit OCR in parallel for instant fallback readiness
-        val localOcrDeferred = async {
-            runMlKitOcr(bitmap)
+        // 2. EXIF orientation + preprocessing
+        onStateUpdate(InvoiceScannerState.ProcessingImage)
+        val imageFile = File(imagePath)
+        val orientedBitmap = ocrImageProcessor.correctExifOrientation(bitmap, imageFile)
+        val processedBitmap = ocrImageProcessor.prepareForOcr(orientedBitmap)
+
+        // 3. Run local ML Kit OCR (ALWAYS runs offline, no internet needed)
+        Log.d(TAG, "Running local ML Kit OCR…")
+        val ocrResult = ocrLanguageRouter.runOfflineOcr(
+            processedBitmap,
+            requestedLanguages = setOf(OcrLanguage.ENGLISH, OcrLanguage.HINDI)
+        )
+
+        val localOcrText = when (ocrResult) {
+            is OcrResult.Success -> ocrResult.fullText
+            is OcrResult.Partial -> ocrResult.fullText
+            is OcrResult.Failure -> ""
         }
 
-        // 3. Read dynamic configuration
+        val hasLocalOcr = localOcrText.isNotBlank()
+        val ocrDurationMs = System.currentTimeMillis() - startTime
+        Log.d(TAG, "Local OCR completed in ${ocrDurationMs}ms, text length=${localOcrText.length}")
+
+        // Detect which scripts are actually present
+        val detectedLanguages = if (hasLocalOcr)
+            ocrLanguageRouter.detectScriptsInText(localOcrText)
+        else setOf(OcrLanguage.ENGLISH)
+
+        val hasPunjabi = detectedLanguages.contains(OcrLanguage.PUNJABI)
+
+        // 4. Read Gemini configuration
         val apiKey = preferences.geminiApiKey.first().trim()
         val primaryModel = preferences.geminiModel.first().trim().ifBlank { "gemini-1.5-flash" }
         val fallbackEnabled = preferences.geminiFallbackEnabled.first()
 
-        // Safe diagnostic logging (NEVER logs API key or auth headers)
-        Log.d(TAG, "Scan session started: apiKeyConfigured=${apiKey.isNotBlank()}, primaryModel=$primaryModel, fallbackEnabled=$fallbackEnabled")
+        Log.d(TAG, "Scan: apiKeyConfigured=${apiKey.isNotBlank()}, model=$primaryModel, " +
+                "ocrTextLen=${localOcrText.length}, detectedLangs=$detectedLanguages")
 
+        // 5. If no API key, fall back to local OCR result
         if (apiKey.isBlank()) {
-            val localOcr = localOcrDeferred.await()
-            preferences.updateScanDiagnostics(primaryModel, "No API Key", System.currentTimeMillis() - startTime, "NO_API_KEY")
-            return@withContext ScanResult.Failure(GeminiError.NoApiKey(), localOcr, imagePath)
+            preferences.updateScanDiagnostics(primaryModel, "No API Key", ocrDurationMs, "NO_API_KEY")
+            return@withContext if (hasLocalOcr) {
+                val invoice = buildInvoiceFromOcr(localOcrText, invoiceId, imagePath)
+                ScanResult.LocalOcrSuccess(invoice, localOcrText, ExtractionSource.LOCAL_OCR)
+            } else {
+                ScanResult.Failure(GeminiError.NoApiKey(), localOcrText, imagePath)
+            }
         }
 
         if (!modelManager.validateModelName(primaryModel)) {
-            val localOcr = localOcrDeferred.await()
-            val error = GeminiError.ModelNotFound(primaryModel, "Invalid model name '$primaryModel' in Settings. Please correct it.")
-            preferences.updateScanDiagnostics(primaryModel, "Invalid Model", System.currentTimeMillis() - startTime, "INVALID_MODEL_NAME")
-            return@withContext ScanResult.Failure(error, localOcr, imagePath)
-        }
-
-        // 4. Encode image to Base64 safely
-        val base64Image = try {
-            encodeBitmapToBase64(bitmap)
-        } catch (oom: OutOfMemoryError) {
-            Log.e(TAG, "OOM while encoding image")
-            val localOcr = localOcrDeferred.await()
-            return@withContext ScanResult.Failure(GeminiError.ImageTooLarge(), localOcr, imagePath)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error encoding image: ${e.message}")
-            val localOcr = localOcrDeferred.await()
-            return@withContext ScanResult.Failure(GeminiError.InvalidImage(e.message ?: "Encoding error"), localOcr, imagePath)
-        }
-
-        // 5. Build candidate models list
-        val candidateModels = modelManager.getCandidateModels(primaryModel, fallbackEnabled)
-        Log.d(TAG, "Candidate models for scan: $candidateModels")
-
-        val retryPolicy = RetryPolicy(maxRetries = 2)
-        var lastError: GeminiError = GeminiError.Unknown("No attempts executed")
-        var successfullyUsedModel: String? = null
-        var extractedInvoice: Invoice? = null
-
-        // 6. Iterate through candidate models
-        for ((index, model) in candidateModels.withIndex()) {
-            val isFallback = index > 0
-            if (isFallback) {
-                Log.d(TAG, "Switching to fallback model: $model (previous model failed)")
-                onStateUpdate(InvoiceScannerState.SwitchingModel(candidateModels[index - 1], model))
-            }
-
-            onStateUpdate(InvoiceScannerState.SendingToGemini(model, attemptNumber = 1))
-
-            val modelResult = retryPolicy.execute(
-                onRetry = { attemptNum, delayMs, error ->
-                    Log.d(TAG, "Retrying model $model (attempt $attemptNum after ${delayMs}ms) due to: ${error::class.simpleName}")
-                    onStateUpdate(InvoiceScannerState.Retrying(model, attemptNum))
-                }
-            ) { attempt ->
-                executeGeminiRequest(model, apiKey, base64Image)
-            }
-
-            if (modelResult.isSuccess) {
-                val rawResponseJson = modelResult.getOrThrow()
-                onStateUpdate(InvoiceScannerState.ExtractingData)
-
-                val parseResult = parseGeminiResponse(rawResponseJson, invoiceId, imagePath)
-                if (parseResult.isSuccess) {
-                    extractedInvoice = parseResult.getOrThrow()
-                    successfullyUsedModel = model
-                    break
-                } else {
-                    val parseEx = parseResult.exceptionOrNull()
-                    Log.w(TAG, "Model $model returned unparseable content: ${parseEx?.message}")
-                    lastError = GeminiError.InvalidJson(parseEx?.message ?: "JSON parse error")
-                }
+            preferences.updateScanDiagnostics(primaryModel, "Invalid Model", ocrDurationMs, "INVALID_MODEL")
+            return@withContext if (hasLocalOcr) {
+                val invoice = buildInvoiceFromOcr(localOcrText, invoiceId, imagePath)
+                ScanResult.LocalOcrSuccess(invoice, localOcrText, ExtractionSource.LOCAL_OCR)
             } else {
-                val ex = modelResult.exceptionOrNull()
-                lastError = (ex as? GeminiException)?.error ?: GeminiError.Unknown(ex?.message ?: "Network error")
-                Log.w(TAG, "Model $model failed with: ${lastError::class.simpleName} (${lastError.userMessage})")
+                ScanResult.Failure(
+                    GeminiError.ModelNotFound(primaryModel, "Invalid model name '$primaryModel'. Please fix in Settings."),
+                    localOcrText, imagePath
+                )
+            }
+        }
 
-                // If error is NOT recoverable with fallback (e.g. Invalid API key, Image too large), stop immediately!
-                if (!modelManager.shouldAttemptFallback(lastError)) {
-                    Log.d(TAG, "Halting fallback attempts due to non-recoverable error (${lastError::class.simpleName})")
-                    break
+        // 6. Run Gemini for visual verification (and Punjabi if present)
+        val candidateModels = modelManager.getCandidateModels(primaryModel, fallbackEnabled)
+
+        for (model in candidateModels) {
+            onStateUpdate(InvoiceScannerState.SendingToGemini(model))
+
+            val geminiResult = callGeminiApi(
+                model = model,
+                apiKey = apiKey,
+                bitmap = processedBitmap,
+                ocrText = localOcrText,
+                needsPunjabiSupport = hasPunjabi
+            )
+
+            when {
+                geminiResult.isSuccess -> {
+                    val geminiInvoice = geminiResult.getOrNull()
+                    if (geminiInvoice != null) {
+                        // Merge Gemini with local OCR: local OCR fills fields Gemini may miss
+                        val mergedInvoice = mergeInvoices(
+                            localOcrInvoice = if (hasLocalOcr) buildInvoiceFromOcr(localOcrText, invoiceId, imagePath) else null,
+                            geminiInvoice = geminiInvoice.copy(id = invoiceId, imagePath = imagePath),
+                            invoiceId = invoiceId,
+                            imagePath = imagePath,
+                            rawOcrText = localOcrText
+                        )
+                        val totalDuration = System.currentTimeMillis() - startTime
+                        preferences.updateScanDiagnostics(model, "Success", totalDuration, "OK")
+                        Log.d(TAG, "Hybrid extraction complete in ${totalDuration}ms using $model")
+                        return@withContext ScanResult.Success(
+                            invoice = mergedInvoice,
+                            modelUsed = model,
+                            extractionSource = if (hasLocalOcr) ExtractionSource.HYBRID else ExtractionSource.GEMINI_AI
+                        )
+                    }
+                }
+                else -> {
+                    val error = (geminiResult.exceptionOrNull() as? GeminiException)?.error
+                        ?: GeminiError.Unknown("Gemini returned empty result")
+
+                    Log.w(TAG, "Gemini model $model failed: ${error.userMessage}")
+
+                    if (!modelManager.shouldAttemptFallback(error)) {
+                        // Non-recoverable – fall through to local OCR
+                        if (hasLocalOcr) {
+                            val invoice = buildInvoiceFromOcr(localOcrText, invoiceId, imagePath)
+                            return@withContext ScanResult.LocalOcrSuccess(invoice, localOcrText, ExtractionSource.LOCAL_OCR)
+                        }
+                        return@withContext ScanResult.Failure(error, localOcrText, imagePath)
+                    }
+
+                    onStateUpdate(InvoiceScannerState.SwitchingModel(model, candidateModels.getOrElse(candidateModels.indexOf(model) + 1) { model }))
                 }
             }
         }
 
-        val totalDuration = System.currentTimeMillis() - startTime
-        val localOcr = localOcrDeferred.await()
+        // 7. All Gemini models failed – use local OCR if available
+        val finalDuration = System.currentTimeMillis() - startTime
+        preferences.updateScanDiagnostics(primaryModel, "GeminiFailed", finalDuration, "GEMINI_ALL_FAILED")
 
-        // 7. Complete and return
-        if (extractedInvoice != null && successfullyUsedModel != null) {
-            Log.d(TAG, "Invoice scan succeeded using model $successfullyUsedModel in ${totalDuration}ms (${extractedInvoice.items.size} items)")
-            preferences.updateScanDiagnostics(successfullyUsedModel, "SUCCESS", totalDuration, "")
-            ScanResult.Success(extractedInvoice, successfullyUsedModel)
+        return@withContext if (hasLocalOcr) {
+            Log.i(TAG, "Gemini unavailable; returning local OCR result")
+            val invoice = buildInvoiceFromOcr(localOcrText, invoiceId, imagePath)
+            ScanResult.LocalOcrSuccess(invoice, localOcrText, ExtractionSource.LOCAL_OCR)
         } else {
-            Log.e(TAG, "All model attempts failed in ${totalDuration}ms. Last error: ${lastError::class.simpleName}")
-            preferences.updateScanDiagnostics(
-                candidateModels.firstOrNull() ?: primaryModel,
-                "FAILED",
-                totalDuration,
-                lastError::class.simpleName ?: "ERROR"
+            ScanResult.Failure(
+                GeminiError.NetworkError("All models failed and no local OCR text available"),
+                "", imagePath
             )
-            ScanResult.Failure(lastError, localOcr, imagePath)
         }
     }
 
-    /**
-     * Executes HTTP POST call to Gemini REST API via OkHttp.
-     * Uses dynamic model and sets API key in `x-goog-api-key` header (never query param).
-     */
-    private suspend fun executeGeminiRequest(
+    // ─── Gemini API call ──────────────────────────────────────────────────
+
+    private suspend fun callGeminiApi(
         model: String,
         apiKey: String,
-        base64Image: String
-    ): Result<String> = withContext(Dispatchers.IO) {
-        val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
-        val requestStartTime = System.currentTimeMillis()
+        bitmap: Bitmap,
+        ocrText: String,
+        needsPunjabiSupport: Boolean
+    ): Result<Invoice> = withContext(Dispatchers.IO) {
+        try {
+            val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
 
-        val prompt = """
-You are an expert invoice extraction assistant for Indian retail and grocery (kirana) stores.
-Analyze the supplied invoice image carefully.
-Extract all available invoice fields accurately.
-Return valid JSON only.
+            val imageBase64 = encodeBitmapToBase64(bitmap)
+            val prompt = buildPrompt(ocrText, needsPunjabiSupport)
 
-Required structure:
+            val requestBody = buildGeminiRequest(prompt, imageBase64)
+
+            val request = Request.Builder()
+                .url(endpoint)
+                .addHeader("x-goog-api-key", apiKey)
+                .addHeader("Content-Type", "application/json")
+                .post(requestBody.toRequestBody(jsonMediaType))
+                .build()
+
+            val response = httpClient.newCall(request).execute()
+            val responseCode = response.code
+            val responseBody = response.body?.string() ?: ""
+            response.close()
+
+            Log.d(TAG, "Gemini HTTP $responseCode from $model (body length: ${responseBody.length})")
+
+            when (responseCode) {
+                200 -> parseGeminiResponse(responseBody)
+                400 -> {
+                    val details = extractErrorMessage(responseBody)
+                    Result.failure(GeminiException(GeminiError.InvalidRequest(details)))
+                }
+                401 -> Result.failure(GeminiException(GeminiError.InvalidApiKey()))
+                403 -> Result.failure(GeminiException(GeminiError.PermissionDenied()))
+                404 -> Result.failure(GeminiException(GeminiError.ModelNotFound(model)))
+                429 -> {
+                    val retryAfter = response.header("Retry-After")?.toLongOrNull()
+                    Result.failure(GeminiException(GeminiError.RateLimited(retryAfter)))
+                }
+                503 -> Result.failure(GeminiException(GeminiError.QuotaExceeded()))
+                in 500..599 -> Result.failure(GeminiException(GeminiError.ServerError(responseCode)))
+                else -> Result.failure(GeminiException(GeminiError.Unknown("HTTP $responseCode")))
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: java.net.SocketTimeoutException) {
+            Result.failure(GeminiException(GeminiError.Timeout()))
+        } catch (e: java.io.IOException) {
+            Result.failure(GeminiException(GeminiError.NetworkError(e.message ?: "IO error")))
+        } catch (t: Throwable) {
+            Result.failure(GeminiException(GeminiError.Unknown(t.message ?: "Unknown error")))
+        }
+    }
+
+    // ─── Request building ─────────────────────────────────────────────────
+
+    private fun buildPrompt(ocrText: String, includePunjabi: Boolean): String {
+        val basePrompt = """You are an expert invoice data extraction assistant for Indian small businesses.
+
+${if (ocrText.isNotBlank()) "The following text was extracted by on-device OCR from the invoice image. Use it to assist your extraction:\n\n--- OCR TEXT START ---\n$ocrText\n--- OCR TEXT END ---\n\n" else ""}Analyze the invoice image carefully.
+
+CRITICAL RULES:
+- Extract ONLY information that is clearly visible in the image.
+- Do NOT fabricate, infer, or guess any field. Use null for missing fields.
+- Preserve original language for product names (do not translate).
+- Use Long integers for all monetary amounts (in paise, where ₹1 = 100 paise).
+- Dates must be in ISO 8601 format: YYYY-MM-DD.
+- GSTIN format: 15 characters (e.g., 27AAPFU0939F1ZV).
+
+${if (includePunjabi) "NOTE: This invoice may contain Punjabi/Gurmukhi script. Extract Gurmukhi text accurately.\n\n" else ""}Return ONLY valid JSON matching this exact structure (no markdown, no code fences):
+
 {
   "supplier_name": null,
+  "supplier_address": null,
+  "supplier_gstin": null,
+  "supplier_phone": null,
   "invoice_number": null,
   "invoice_date": null,
   "due_date": null,
-  "subtotal": null,
-  "discount": null,
-  "tax": null,
-  "grand_total": null,
+  "subtotal_paise": null,
+  "discount_paise": null,
+  "tax_paise": null,
+  "grand_total_paise": null,
   "items": [
     {
       "product_name": "",
+      "hsn_sac": null,
       "quantity": null,
       "unit": null,
-      "unit_price": null,
-      "tax_percentage": null,
-      "line_total": null
+      "unit_price_paise": null,
+      "discount_paise": null,
+      "gst_rate_percent": null,
+      "line_total_paise": null
     }
-  ],
-  "warnings": []
-}
+  ]
+}"""
+        return basePrompt
+    }
 
-Rules:
-- Never invent unreadable values.
-- Use null for missing information.
-- Preserve actual invoice values.
-- Do not calculate missing values by guessing.
-- Include all identifiable invoice items.
-- Return JSON without Markdown code fences.
-        """.trimIndent()
-
-        val requestPayload = JSONObject().apply {
+    private fun buildGeminiRequest(prompt: String, imageBase64: String): String {
+        val requestJson = JSONObject().apply {
             put("contents", JSONArray().apply {
                 put(JSONObject().apply {
+                    put("role", "user")
                     put("parts", JSONArray().apply {
-                        put(JSONObject().apply { put("text", prompt) })
+                        // Image part
                         put(JSONObject().apply {
                             put("inline_data", JSONObject().apply {
                                 put("mime_type", "image/jpeg")
-                                put("data", base64Image)
+                                put("data", imageBase64)
                             })
+                        })
+                        // Text prompt part
+                        put(JSONObject().apply {
+                            put("text", prompt)
                         })
                     })
                 })
             })
             put("generationConfig", JSONObject().apply {
-                put("response_mime_type", "application/json")
                 put("temperature", 0.1)
+                put("topP", 0.8)
+                put("maxOutputTokens", 4096)
             })
         }
-
-        val requestBody = requestPayload.toString().toRequestBody(jsonMediaType)
-        val request = Request.Builder()
-            .url(endpoint)
-            .addHeader("x-goog-api-key", apiKey)
-            .addHeader("Content-Type", "application/json")
-            .post(requestBody)
-            .build()
-
-        try {
-            httpClient.newCall(request).execute().use { response ->
-                val duration = System.currentTimeMillis() - requestStartTime
-                val code = response.code
-                Log.d(TAG, "Gemini response HTTP $code received in ${duration}ms for model=$model")
-
-                val bodyString = response.body?.string() ?: ""
-
-                if (response.isSuccessful) {
-                    if (bodyString.isBlank()) {
-                        return@withContext Result.failure(GeminiException(GeminiError.EmptyResponse()))
-                    }
-                    Result.success(bodyString)
-                } else {
-                    val retryAfterSeconds = response.header("Retry-After")?.toLongOrNull()
-                    val error = classifyHttpError(code, bodyString, model, retryAfterSeconds)
-                    Result.failure(GeminiException(error))
-                }
-            }
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (te: SocketTimeoutException) {
-            Log.w(TAG, "Gemini request timed out: ${te.message}")
-            Result.failure(GeminiException(GeminiError.Timeout()))
-        } catch (ioe: IOException) {
-            Log.w(TAG, "Gemini network failure: ${ioe.message}")
-            Result.failure(GeminiException(GeminiError.NetworkError(ioe.localizedMessage ?: "Connection error")))
-        } catch (t: Throwable) {
-            Log.e(TAG, "Unexpected HTTP exception: ${t.message}")
-            Result.failure(GeminiException(GeminiError.Unknown(t.message ?: "Unknown error")))
-        }
+        return requestJson.toString()
     }
 
-    /**
-     * Maps HTTP status codes and response error JSON to typed GeminiError.
-     */
-    private fun classifyHttpError(
-        code: Int,
-        body: String,
-        model: String,
-        retryAfter: Long?
-    ): GeminiError {
-        val lowerBody = body.lowercase()
-        return when (code) {
-            400 -> {
-                when {
-                    lowerBody.contains("image") || lowerBody.contains("payload") ->
-                        GeminiError.InvalidImage("Invalid image encoding or format")
-                    lowerBody.contains("model") ->
-                        GeminiError.ModelNotFound(model, "Model '$model' rejected by server (HTTP 400)")
-                    else ->
-                        GeminiError.InvalidRequest("Malformed request payload (HTTP 400)")
-                }
-            }
-            401 -> GeminiError.InvalidApiKey("Invalid Gemini API key (HTTP 401)")
-            403 -> {
-                if (lowerBody.contains("quota") || lowerBody.contains("rate")) {
-                    GeminiError.QuotaExceeded(retryAfter, "Quota exceeded for model '$model' (HTTP 403)")
-                } else {
-                    GeminiError.PermissionDenied("Access denied or API not enabled for key (HTTP 403)")
-                }
-            }
-            404 -> GeminiError.ModelNotFound(model, "Model '$model' not found or discontinued (HTTP 404)")
-            429 -> {
-                if (lowerBody.contains("quota") || lowerBody.contains("resource_exhausted")) {
-                    GeminiError.QuotaExceeded(retryAfter, "Daily or project quota exceeded for model '$model' (HTTP 429)")
-                } else {
-                    GeminiError.RateLimited(retryAfter, "Rate limit reached for model '$model' (HTTP 429)")
-                }
-            }
-            500, 502, 503, 504 -> GeminiError.ServerError(code, "Google Gemini server error ($code)")
-            else -> GeminiError.Unknown("Gemini API error (HTTP $code)")
-        }
-    }
+    // ─── Response parsing ─────────────────────────────────────────────────
 
-    /**
-     * Parses the Gemini envelope and maps valid JSON to domain Invoice & items.
-     * Guaranteed never to invent fake or hardcoded default items.
-     */
-    private fun parseGeminiResponse(
-        rawEnvelopeJson: String,
-        invoiceId: String,
-        imagePath: String
-    ): Result<Invoice> {
+    private fun parseGeminiResponse(responseBody: String): Result<Invoice> {
         return try {
-            val root = JSONObject(rawEnvelopeJson)
+            val root = JSONObject(responseBody)
+
+            // Check for safety blocks
             val candidates = root.optJSONArray("candidates")
-                ?: return Result.failure(IllegalArgumentException("No candidates returned by Gemini"))
-
-            if (candidates.length() == 0) {
-                return Result.failure(IllegalArgumentException("Empty candidates array in response"))
+            if (candidates == null || candidates.length() == 0) {
+                val promptFeedback = root.optJSONObject("promptFeedback")
+                val blockReason = promptFeedback?.optString("blockReason", "")
+                if (!blockReason.isNullOrBlank()) {
+                    return Result.failure(GeminiException(GeminiError.ContentBlocked(blockReason)))
+                }
+                return Result.failure(GeminiException(GeminiError.EmptyResponse()))
             }
 
-            val firstCandidate = candidates.getJSONObject(0)
-            val finishReason = firstCandidate.optString("finishReason", "")
-            if (finishReason == "SAFETY" || finishReason == "BLOCKLIST") {
-                return Result.failure(GeminiException(GeminiError.ContentBlocked(finishReason)))
+            val candidate = candidates.getJSONObject(0)
+            val finishReason = candidate.optString("finishReason", "")
+            if (finishReason == "SAFETY") {
+                return Result.failure(GeminiException(GeminiError.ContentBlocked("SAFETY")))
             }
 
-            val content = firstCandidate.optJSONObject("content")
-                ?: return Result.failure(IllegalArgumentException("No content object in candidate"))
+            val content = candidate.optJSONObject("content")
+                ?: return Result.failure(GeminiException(GeminiError.EmptyResponse()))
+
             val parts = content.optJSONArray("parts")
-                ?: return Result.failure(IllegalArgumentException("No parts array in content"))
-            if (parts.length() == 0) {
-                return Result.failure(IllegalArgumentException("Empty parts array"))
-            }
+                ?: return Result.failure(GeminiException(GeminiError.EmptyResponse()))
 
-            val rawContentText = parts.getJSONObject(0).optString("text", "")
-            if (rawContentText.isBlank()) {
-                return Result.failure(IllegalArgumentException("Empty text in Gemini content part"))
-            }
-
-            // Clean markdown code fences if Gemini added them
-            val cleanJson = rawContentText.trim()
-                .removePrefix("```json")
-                .removePrefix("```JSON")
-                .removePrefix("```")
-                .removeSuffix("```")
+            val rawText = (0 until parts.length())
+                .map { parts.getJSONObject(it).optString("text", "") }.filter { it.isNotBlank() }
+                .joinToString("")
                 .trim()
 
-            val obj = JSONObject(cleanJson)
-
-            val supplierName = obj.optString("supplier_name", "").let { if (it == "null") "" else it.trim() }
-            val invoiceNumber = obj.optString("invoice_number", "").let { if (it == "null") "" else it.trim() }
-            val grandTotalDouble = if (obj.isNull("grand_total")) 0.0 else obj.optDouble("grand_total", 0.0)
-            val grandTotalPaise = (grandTotalDouble * 100).toLong()
-
-            val itemsArray = obj.optJSONArray("items") ?: JSONArray()
-            val items = mutableListOf<InvoiceItem>()
-
-            for (i in 0 until itemsArray.length()) {
-                val itemObj = itemsArray.optJSONObject(i) ?: continue
-                val rawName = itemObj.optString("product_name", "")
-                val name = if (rawName.isBlank() || rawName == "null") "Item ${i + 1}" else rawName.trim()
-                val qty = if (itemObj.isNull("quantity")) 1.0 else itemObj.optDouble("quantity", 1.0)
-                val unit = itemObj.optString("unit", "pcs").let { if (it == "null" || it.isBlank()) "pcs" else it.trim() }
-                val unitPrice = if (itemObj.isNull("unit_price")) 0.0 else itemObj.optDouble("unit_price", 0.0)
-                val unitPricePaise = (unitPrice * 100).toLong()
-                val lineTotal = if (itemObj.isNull("line_total")) qty * unitPrice else itemObj.optDouble("line_total", qty * unitPrice)
-                val lineTotalPaise = (lineTotal * 100).toLong()
-
-                items.add(
-                    InvoiceItem(
-                        id = UuidGenerator.generate(),
-                        invoiceId = invoiceId,
-                        productName = name,
-                        quantity = qty,
-                        unit = unit,
-                        purchasePricePaise = unitPricePaise,
-                        lineTotalPaise = lineTotalPaise
-                    )
-                )
+            if (rawText.isBlank()) {
+                return Result.failure(GeminiException(GeminiError.EmptyResponse()))
             }
 
-            val calculatedTotal = if (grandTotalPaise > 0) grandTotalPaise else items.sumOf { it.lineTotalPaise }
+            // Extract JSON from response (may be wrapped in markdown code fences)
+            val jsonText = extractJsonFromText(rawText)
+                ?: return Result.failure(GeminiException(GeminiError.InvalidJson("No JSON object found in response")))
+
+            val invoiceJson = JSONObject(jsonText)
+            buildInvoiceFromJson(invoiceJson)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: org.json.JSONException) {
+            Result.failure(GeminiException(GeminiError.InvalidJson("JSON parse error: ${e.message}")))
+        } catch (t: Throwable) {
+            Result.failure(GeminiException(GeminiError.Unknown(t.message ?: "Parse error")))
+        }
+    }
+
+    private fun extractJsonFromText(text: String): String? {
+        // Try to find JSON between code fences
+        val fencePattern = Regex("""```(?:json)?\s*(\{[\s\S]*?\})\s*```""")
+        val fenceMatch = fencePattern.find(text)
+        if (fenceMatch != null) return fenceMatch.groupValues[1]
+
+        // Try to find the first { ... } block
+        val start = text.indexOf('{')
+        val end = text.lastIndexOf('}')
+        if (start >= 0 && end > start) return text.substring(start, end + 1)
+
+        return null
+    }
+
+    private fun buildInvoiceFromJson(json: JSONObject): Result<Invoice> {
+        return try {
             val now = System.currentTimeMillis()
+            val invoiceId = UuidGenerator.generate()
+
+            val supplierName = json.optString("supplier_name", "").nullIfBlank()
+            val invoiceNumber = json.optString("invoice_number", "").nullIfBlank()
+
+            val invoiceDateStr = json.optString("invoice_date", "")
+            val invoiceDate = parseIsoDate(invoiceDateStr) ?: now
+
+            val subtotalPaise = json.optLong("subtotal_paise", 0L)
+            val discountPaise = json.optLong("discount_paise", 0L)
+            val taxPaise = json.optLong("tax_paise", 0L)
+            val grandTotalPaise = json.optLong("grand_total_paise", 0L)
+
+            val items = mutableListOf<InvoiceItem>()
+            val itemsArray = json.optJSONArray("items")
+            if (itemsArray != null) {
+                for (i in 0 until itemsArray.length()) {
+                    val itemJson = itemsArray.getJSONObject(i)
+                    val name = itemJson.optString("product_name", "").trim()
+                    if (name.isBlank()) continue
+
+                    val qty = itemJson.optDouble("quantity", 1.0).let { if (it.isNaN() || it <= 0) 1.0 else it }
+                    val unitPrice = itemJson.optLong("unit_price_paise", 0L)
+                    val lineTotal = itemJson.optLong("line_total_paise", 0L)
+                    val unit = itemJson.optString("unit", "pcs").nullIfBlank() ?: "pcs"
+                    val gstRate = if (itemJson.isNull("gst_rate_percent")) null else itemJson.optDouble("gst_rate_percent", 0.0)
+                    val itemDiscount = itemJson.optLong("discount_paise", 0L)
+
+                    // Validate line total
+                    val computedLineTotal = (qty * unitPrice).toLong()
+                    val effectiveLineTotal = when {
+                        lineTotal > 0 -> lineTotal
+                        computedLineTotal > 0 -> computedLineTotal
+                        else -> 0L
+                    }
+
+                    items.add(
+                        InvoiceItem(
+                            id = UuidGenerator.generate(),
+                            invoiceId = invoiceId,
+                            productName = name,
+                            quantity = qty,
+                            unit = unit,
+                            purchasePricePaise = unitPrice,
+                            discountPaise = itemDiscount,
+                            lineTotalPaise = effectiveLineTotal
+                        )
+                    )
+                }
+            }
+
+            // Compute effective grand total
+            val effectiveGrandTotal = when {
+                grandTotalPaise > 0 -> grandTotalPaise
+                items.isNotEmpty()  -> items.sumOf { it.lineTotalPaise } - discountPaise + taxPaise
+                else                -> 0L
+            }
 
             val invoice = Invoice(
                 id = invoiceId,
-                invoiceNumber = invoiceNumber,
-                supplierName = supplierName,
-                invoiceDate = now,
-                subtotalPaise = calculatedTotal,
-                grandTotalPaise = calculatedTotal,
+                invoiceNumber = invoiceNumber ?: "",
+                supplierName = supplierName ?: "",
+                invoiceDate = invoiceDate,
+                subtotalPaise = subtotalPaise,
+                discountPaise = discountPaise,
+                taxPaise = taxPaise,
+                grandTotalPaise = effectiveGrandTotal,
                 status = InvoiceStatus.DRAFT,
-                imagePath = imagePath,
-                rawOcrText = rawContentText,
                 items = items,
                 scannedAt = now,
                 createdAt = now,
@@ -461,45 +528,30 @@ Rules:
 
             Result.success(invoice)
         } catch (t: Throwable) {
-            Result.failure(t)
+            Result.failure(GeminiException(GeminiError.InvalidJson(t.message ?: "Build error")))
         }
     }
 
-    /**
-     * On-device ML Kit OCR helper using bundled model. Never throws.
-     */
-    suspend fun runMlKitOcr(bitmap: Bitmap): String {
-        return try {
-            val inputImage = InputImage.fromBitmap(bitmap, 0)
-            val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-            val visionText = suspendCancellableCoroutine<com.google.mlkit.vision.text.Text?> { cont ->
-                recognizer.process(inputImage)
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener {
-                        Log.w(TAG, "ML Kit OCR failed: ${it.message}")
-                        cont.resume(null)
-                    }
-            }
-            visionText?.text ?: ""
-        } catch (t: Throwable) {
-            Log.w(TAG, "ML Kit text recognition caught error: ${t.message}")
-            ""
-        }
-    }
+    // ─── Invoice building from OCR ────────────────────────────────────────
 
-    /**
-     * Creates an invoice from pure offline OCR text when the user selects 'Use Offline OCR'.
-     */
-    fun createInvoiceFromOcr(ocrText: String, invoiceId: String, imagePath: String): Invoice {
+    private fun buildInvoiceFromOcr(ocrText: String, invoiceId: String, imagePath: String): Invoice {
         val parsed = InvoiceParser.parse(ocrText, invoiceId)
         val now = System.currentTimeMillis()
+        val effectiveTotal = when {
+            parsed.grandTotalPaise > 0 -> parsed.grandTotalPaise
+            parsed.items.isNotEmpty()  -> parsed.items.sumOf { it.lineTotalPaise }
+            else                       -> 0L
+        }
         return Invoice(
             id = invoiceId,
             invoiceNumber = parsed.invoiceNumber,
             supplierName = parsed.supplierName,
-            invoiceDate = if (parsed.invoiceDate > 0) parsed.invoiceDate else now,
-            subtotalPaise = parsed.grandTotalPaise,
-            grandTotalPaise = parsed.grandTotalPaise,
+            invoiceDate = parsed.invoiceDate,
+            dueDate = parsed.dueDate,
+            subtotalPaise = parsed.subtotalPaise,
+            discountPaise = parsed.discountPaise,
+            taxPaise = parsed.taxPaise,
+            grandTotalPaise = effectiveTotal,
             status = InvoiceStatus.DRAFT,
             imagePath = imagePath,
             rawOcrText = ocrText,
@@ -511,8 +563,47 @@ Rules:
     }
 
     /**
-     * Creates a blank manual invoice for the captured image when user chooses 'Enter Manually'.
+     * Merge local OCR and Gemini extraction.
+     * Strategy: Gemini wins for structured fields it confidently returned.
+     *           Local OCR fills in gaps (especially product names in original language).
      */
+    private fun mergeInvoices(
+        localOcrInvoice: Invoice?,
+        geminiInvoice: Invoice,
+        invoiceId: String,
+        imagePath: String,
+        rawOcrText: String
+    ): Invoice {
+        val local = localOcrInvoice
+        val now = System.currentTimeMillis()
+
+        return geminiInvoice.copy(
+            id = invoiceId,
+            imagePath = imagePath,
+            rawOcrText = rawOcrText,
+            // Prefer Gemini's structured data; fall back to local OCR for blank fields
+            supplierName = geminiInvoice.supplierName.ifBlank { local?.supplierName ?: "" },
+            invoiceNumber = geminiInvoice.invoiceNumber.ifBlank { local?.invoiceNumber ?: "" },
+            grandTotalPaise = geminiInvoice.grandTotalPaise.let {
+                if (it > 0) it else local?.grandTotalPaise ?: 0L
+            },
+            // If Gemini found no items but local OCR did, use local items
+            items = if (geminiInvoice.items.isNotEmpty()) {
+                geminiInvoice.items.map { it.copy(invoiceId = invoiceId) }
+            } else {
+                local?.items?.map { it.copy(invoiceId = invoiceId) } ?: emptyList()
+            },
+            status = InvoiceStatus.DRAFT,
+            scannedAt = now,
+            updatedAt = now
+        )
+    }
+
+    // ─── Public helpers (used by scanner for offline/manual paths) ────────
+
+    fun createInvoiceFromOcr(ocrText: String, invoiceId: String, imagePath: String): Invoice =
+        buildInvoiceFromOcr(ocrText, invoiceId, imagePath)
+
     fun createBlankManualInvoice(invoiceId: String, imagePath: String): Invoice {
         val now = System.currentTimeMillis()
         return Invoice(
@@ -531,6 +622,21 @@ Rules:
             updatedAt = now
         )
     }
+
+    /** Used by the scanner screen for retry – runs only Gemini (no ML Kit re-run). */
+    suspend fun runMlKitOcr(bitmap: Bitmap): String {
+        val result = ocrLanguageRouter.runOfflineOcr(
+            bitmap,
+            requestedLanguages = setOf(OcrLanguage.ENGLISH, OcrLanguage.HINDI)
+        )
+        return when (result) {
+            is OcrResult.Success -> result.fullText
+            is OcrResult.Partial -> result.fullText
+            is OcrResult.Failure -> ""
+        }
+    }
+
+    // ─── Utilities ────────────────────────────────────────────────────────
 
     private fun encodeBitmapToBase64(bitmap: Bitmap): String {
         val scaled = scaleBitmap(bitmap, 1600)
@@ -560,4 +666,21 @@ Rules:
             true
         )
     }
+
+    private fun extractErrorMessage(body: String): String {
+        return try {
+            JSONObject(body).optJSONObject("error")?.optString("message", body) ?: body
+        } catch (_: Exception) { body }
+    }
+
+    private fun parseIsoDate(dateStr: String): Long? {
+        if (dateStr.isBlank()) return null
+        return try {
+            val sdf = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
+            sdf.isLenient = false
+            sdf.parse(dateStr)?.time
+        } catch (_: Exception) { null }
+    }
+
+    private fun String?.nullIfBlank(): String? = if (isNullOrBlank()) null else this
 }

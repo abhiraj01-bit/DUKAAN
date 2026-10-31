@@ -55,7 +55,7 @@ sealed interface InvoiceScannerState {
     data class Retrying(val modelName: String, val retryNumber: Int) : InvoiceScannerState
     data class SwitchingModel(val previousModel: String, val newModel: String) : InvoiceScannerState
     object ExtractingData : InvoiceScannerState
-    data class Success(val invoice: Invoice, val modelUsed: String) : InvoiceScannerState
+    data class Success(val invoice: Invoice, val modelUsed: String, val extractionSource: com.dukaan.app.core.ocr.ExtractionSource = com.dukaan.app.core.ocr.ExtractionSource.HYBRID) : InvoiceScannerState
     data class Error(
         val error: GeminiError,
         val canRetry: Boolean,
@@ -254,7 +254,7 @@ class InvoiceScannerViewModel @Inject constructor(
                     is ScanResult.Success -> {
                         invoiceRepository.saveInvoice(result.invoice)
                         _uiState.update {
-                            it.copy(scannerState = InvoiceScannerState.Success(result.invoice, result.modelUsed))
+                            it.copy(scannerState = InvoiceScannerState.Success(result.invoice, result.modelUsed, result.extractionSource))
                         }
                         onReady(result.invoice.id)
                     }
@@ -275,6 +275,9 @@ class InvoiceScannerViewModel @Inject constructor(
 
                     is ScanResult.LocalOcrSuccess -> {
                         invoiceRepository.saveInvoice(result.invoice)
+                        _uiState.update {
+                            it.copy(scannerState = InvoiceScannerState.Success(result.invoice, "Offline OCR", result.extractionSource))
+                        }
                         onReady(result.invoice.id)
                     }
                 }

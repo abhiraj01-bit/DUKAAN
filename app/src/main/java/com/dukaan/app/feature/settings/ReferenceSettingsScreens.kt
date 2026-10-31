@@ -31,6 +31,14 @@ import com.dukaan.app.core.designsystem.components.*
 import com.dukaan.app.core.designsystem.theme.*
 import com.dukaan.app.core.datastore.DukaanPreferences
 import com.dukaan.app.core.navigation.Screen
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import com.dukaan.app.core.util.DateFormatter
+import com.dukaan.app.core.worker.MonthlyKhataSmsWorker
 import com.dukaan.app.core.util.UuidGenerator
 import com.dukaan.app.domain.model.Product
 import com.dukaan.app.domain.model.ShopProfile
@@ -107,6 +115,20 @@ class SettingsReferenceViewModel @Inject constructor(
         }
         viewModelScope.launch {
             preferences.geminiModel.collect { _geminiModel.value = it }
+        }
+    }
+
+    val autoMonthlySms = preferences.autoMonthlySms
+    val nextMonthlySmsDate = preferences.nextMonthlySmsDate
+
+    fun setAutoMonthlySms(enabled: Boolean, context: Context) {
+        viewModelScope.launch {
+            preferences.setAutoMonthlySms(enabled)
+            if (enabled) {
+                MonthlyKhataSmsWorker.schedule(context, preferences)
+            } else {
+                MonthlyKhataSmsWorker.cancel(context)
+            }
         }
     }
 
@@ -278,6 +300,18 @@ fun ReferenceSettingsScreen(
     val geminiKey by viewModel.geminiKey.collectAsState()
     val geminiModel by viewModel.geminiModel.collectAsState()
     var showGeminiDialog by remember { mutableStateOf(false) }
+    var showMonthlySmsDialog by remember { mutableStateOf(false) }
+    val autoMonthlySms by viewModel.autoMonthlySms.collectAsState(initial = false)
+    val nextMonthlySmsDate by viewModel.nextMonthlySmsDate.collectAsState(initial = 0L)
+    val context = androidx.compose.ui.platform.LocalContext.current
+
+    val smsPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            viewModel.setAutoMonthlySms(true, context)
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -443,6 +477,77 @@ fun ReferenceSettingsScreen(
                 }
             }
         }
+    }
+
+    if (showMonthlySmsDialog) {
+        AlertDialog(
+            onDismissRequest = { showMonthlySmsDialog = false },
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Sms, contentDescription = null, tint = ForestGreen)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Monthly SMS Reminders", fontWeight = FontWeight.Bold)
+                }
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    Text(
+                        "Automatically send payment reminders from your phone's SIM card to all customers who have pending balances at the end of every calendar month at 8:00 PM.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = SecondaryText
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Automatic Monthly SMS", style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold))
+                            Text(if (autoMonthlySms) "Reminders will send automatically" else "Disabled", style = MaterialTheme.typography.bodySmall, color = SecondaryText)
+                        }
+                        Switch(
+                            checked = autoMonthlySms,
+                            onCheckedChange = { isChecked ->
+                                if (isChecked) {
+                                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED) {
+                                        viewModel.setAutoMonthlySms(true, context)
+                                    } else {
+                                        smsPermissionLauncher.launch(Manifest.permission.SEND_SMS)
+                                    }
+                                } else {
+                                    viewModel.setAutoMonthlySms(false, context)
+                                }
+                            },
+                            colors = SwitchDefaults.colors(checkedThumbColor = ForestGreen, checkedTrackColor = ForestGreen.copy(alpha = 0.5f))
+                        )
+                    }
+
+                    if (autoMonthlySms) {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = LightGreenSurface),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text("Schedule Status", style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold), color = PrimaryText)
+                                val nextTimestamp = if (nextMonthlySmsDate > 0L) nextMonthlySmsDate else MonthlyKhataSmsWorker.calculateNextMonthEndTimestamp()
+                                Text("Next Run:  at 8:00 PM", style = MaterialTheme.typography.bodySmall, color = ForestGreen, fontWeight = FontWeight.SemiBold)
+                                Text("Applies to all customers with balance > ?0", style = MaterialTheme.typography.labelSmall, color = SecondaryText)
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = { showMonthlySmsDialog = false },
+                    colors = ButtonDefaults.buttonColors(containerColor = ForestGreen)
+                ) {
+                    Text("Done")
+                }
+            }
+        )
     }
 
     if (showGeminiDialog) {

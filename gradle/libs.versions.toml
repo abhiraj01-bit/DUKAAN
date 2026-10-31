@@ -17,6 +17,8 @@ room = "2.7.1"
 datastore = "1.1.4"
 cameraX = "1.4.2"
 mlkitTextRecognition = "16.0.1"
+mlkitTextRecognitionDevanagari = "16.0.1"
+mlkitTextRecognitionChinese = "16.0.0"
 workmanager = "2.10.1"
 coroutines = "1.10.2"
 mockk = "1.14.2"
@@ -70,6 +72,7 @@ camerax-view = { group = "androidx.camera", name = "camera-view", version.ref = 
 
 # ML Kit
 mlkit-text-recognition = { group = "com.google.mlkit", name = "text-recognition", version.ref = "mlkitTextRecognition" }
+mlkit-text-recognition-devanagari = { group = "com.google.mlkit", name = "text-recognition-devanagari", version.ref = "mlkitTextRecognitionDevanagari" }
 
 # WorkManager
 workmanager-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "workmanager" }

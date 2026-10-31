@@ -107,7 +107,11 @@ dependencies {
     implementation(libs.camerax.view)
 
     // ML Kit - Text Recognition (offline/bundled model)
+    // ML Kit - Text Recognition (offline/bundled models)
+    // Latin/English - bundled, works fully offline
     implementation(libs.mlkit.text.recognition)
+    // Devanagari/Hindi - bundled, works fully offline
+    implementation(libs.mlkit.text.recognition.devanagari)
 
     // WorkManager
     implementation(libs.workmanager.ktx)

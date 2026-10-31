@@ -2,6 +2,7 @@ package com.dukaan.app.feature.invoice
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.dukaan.app.core.ocr.ExtractionSource
 import com.dukaan.app.core.util.UuidGenerator
 import com.dukaan.app.domain.model.*
 import com.dukaan.app.domain.repository.*
@@ -18,7 +19,9 @@ data class InvoiceReviewUiState(
     val grandTotalPaise: Long = 0L,
     val isLoading: Boolean = true,
     val isConfirmed: Boolean = false,
-    val error: String? = null
+    val error: String? = null,
+    val extractionSource: ExtractionSource = ExtractionSource.LOCAL_OCR,
+    val validationWarnings: List<String> = emptyList()
 )
 
 @HiltViewModel
@@ -36,6 +39,10 @@ class InvoiceReviewViewModel @Inject constructor(
         viewModelScope.launch {
             val inv = invoiceRepository.getInvoiceById(invoiceId)
             if (inv != null) {
+                val validation = if (!inv.rawOcrText.isNullOrBlank()) {
+                    InvoiceParser.validate(InvoiceParser.parse(inv.rawOcrText, inv.id))
+                } else null
+
                 _uiState.update {
                     it.copy(
                         invoice = inv,
@@ -43,7 +50,8 @@ class InvoiceReviewViewModel @Inject constructor(
                         invoiceNumber = inv.invoiceNumber,
                         items = inv.items,
                         grandTotalPaise = inv.grandTotalPaise,
-                        isLoading = false
+                        isLoading = false,
+                        validationWarnings = validation?.warnings ?: emptyList()
                     )
                 }
             } else {

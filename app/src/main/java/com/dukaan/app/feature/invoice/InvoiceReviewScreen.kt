@@ -20,6 +20,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavController
 import com.dukaan.app.core.designsystem.components.*
 import com.dukaan.app.core.designsystem.theme.*
+import com.dukaan.app.core.ocr.ExtractionSource
 import com.dukaan.app.core.util.CurrencyFormatter
 import com.dukaan.app.core.util.DateFormatter
 import com.dukaan.app.core.util.formatQuantity
@@ -125,6 +126,28 @@ fun InvoiceReviewScreen(
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = RoundedCornerShape(10.dp)
                             )
+                        }
+                    }
+                }
+
+                // Validation warnings banner
+                if (state.validationWarnings.isNotEmpty()) {
+                    item {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = androidx.compose.ui.graphics.Color(0xFFFFF3CD)),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.Warning, contentDescription = null, tint = androidx.compose.ui.graphics.Color(0xFFE65100), modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Please verify these fields", style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold), color = androidx.compose.ui.graphics.Color(0xFFE65100))
+                                }
+                                state.validationWarnings.forEach { warning ->
+                                    Text("• $warning", style = MaterialTheme.typography.bodySmall, color = androidx.compose.ui.graphics.Color(0xFF5D4037))
+                                }
+                            }
                         }
                     }
                 }
