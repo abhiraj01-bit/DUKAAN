@@ -41,17 +41,22 @@ class SmsSendingService @Inject constructor(
 ) {
     companion object {
         private const val TAG = "SmsSendingService"
-        private const val SMS_SENT_TIMEOUT_MS = 20_000L
+        private const val SMS_SENT_TIMEOUT_MS = 15_000L
     }
 
     /**
      * Checks if SEND_SMS permission is granted.
      */
     fun hasSmsPermission(): Boolean {
-        return ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.SEND_SMS
-        ) == PackageManager.PERMISSION_GRANTED
+        return try {
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.SEND_SMS
+            ) == PackageManager.PERMISSION_GRANTED
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking SEND_SMS permission: ${e.message}", e)
+            false
+        }
     }
 
     /**
@@ -92,143 +97,229 @@ class SmsSendingService @Inject constructor(
         messageText: String,
         preferredSubId: Int? = null
     ): SmsSendResult = withContext(Dispatchers.IO) {
-
-        if (!hasSmsPermission()) {
-            Log.e(TAG, "SEND_SMS permission not granted")
-            return@withContext SmsSendResult.Failure(smsId, "SEND_SMS permission not granted on device")
-        }
-
-        val cleanPhone = cleanPhoneNumber(destinationAddress)
-        if (cleanPhone.length < 10) {
-            Log.e(TAG, "Invalid phone number: $destinationAddress")
-            return@withContext SmsSendResult.Failure(smsId, "Invalid customer phone number ($destinationAddress)")
-        }
-
-        val subIdToUse = preferredSubId ?: preferences.preferredSimSubId.first().let { if (it >= 0) it else null }
-
-        val smsManager = try {
-            resolveSmsManager(subIdToUse)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to resolve SmsManager: ${e.message}")
-            return@withContext SmsSendResult.Failure(smsId, "Could not access device SMS service: ${e.message}")
-        }
-
-        val sentIntent = PendingIntent.getBroadcast(
-            context,
-            smsId.hashCode(),
-            Intent(SmsDeliveryReceiver.ACTION_SMS_SENT).apply {
-                setPackage(context.packageName)
-                putExtra(SmsDeliveryReceiver.EXTRA_SMS_ID, smsId)
-            },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val deliveryIntent = PendingIntent.getBroadcast(
-            context,
-            smsId.hashCode() + 1,
-            Intent(SmsDeliveryReceiver.ACTION_SMS_DELIVERED).apply {
-                setPackage(context.packageName)
-                putExtra(SmsDeliveryReceiver.EXTRA_SMS_ID, smsId)
-            },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        // Split message if text exceeds single SMS character limit (multi-part SMS)
-        val parts = smsManager.divideMessage(messageText)
-        val numParts = parts.size
-
-        val sentIntents = ArrayList<PendingIntent>()
-        val deliveryIntents = ArrayList<PendingIntent>()
-        for (i in 0 until numParts) {
-            // Only attach callback to the last part or all parts
-            sentIntents.add(sentIntent)
-            deliveryIntents.add(deliveryIntent)
-        }
-
-        Log.d(TAG, "Dispatching direct SIM SMS for smsId=$smsId to $cleanPhone (${parts.size} parts, subId=$subIdToUse)")
-
         try {
-            if (parts.size > 1) {
-                smsManager.sendMultipartTextMessage(
-                    cleanPhone,
-                    null,
-                    parts,
-                    sentIntents,
-                    deliveryIntents
-                )
+            if (!hasSmsPermission()) {
+                Log.e(TAG, "SEND_SMS permission not granted on device")
+                return@withContext SmsSendResult.Failure(smsId, "SEND_SMS permission not granted. Please allow SMS permission in app settings.")
+            }
+
+            val cleanPhone = cleanPhoneNumber(destinationAddress)
+            if (cleanPhone.length < 10) {
+                Log.e(TAG, "Invalid customer phone number length: ${cleanPhone.length}")
+                return@withContext SmsSendResult.Failure(smsId, "Invalid customer mobile number ($destinationAddress). Must be a valid 10-digit number.")
+            }
+
+            val subIdToUse = try {
+                preferredSubId ?: preferences.preferredSimSubId.first().let { if (it >= 0) it else null }
+            } catch (e: Exception) {
+                null
+            }
+
+            val smsManager = resolveSmsManager(subIdToUse)
+            if (smsManager == null) {
+                Log.e(TAG, "Could not resolve an SmsManager instance on this device")
+                return@withContext SmsSendResult.Failure(smsId, "Cellular SMS service is unavailable on this device. Please check SIM card.")
+            }
+
+            // PendingIntent flags: On Android 12+ (API 31+), telephony callbacks require FLAG_MUTABLE so the system can fill in result data
+            val pendingIntentFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
             } else {
-                smsManager.sendTextMessage(
-                    cleanPhone,
-                    null,
-                    messageText,
-                    sentIntent,
-                    deliveryIntent
+                PendingIntent.FLAG_UPDATE_CURRENT
+            }
+
+            val sentReqCode = smsId.hashCode() and 0x7FFFFFFF
+            val deliveryReqCode = (smsId.hashCode() + 31) and 0x7FFFFFFF
+
+            val sentIntent = try {
+                PendingIntent.getBroadcast(
+                    context,
+                    sentReqCode,
+                    Intent(context, SmsDeliveryReceiver::class.java).apply {
+                        action = SmsDeliveryReceiver.ACTION_SMS_SENT
+                        putExtra(SmsDeliveryReceiver.EXTRA_SMS_ID, smsId)
+                    },
+                    pendingIntentFlags
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed creating sent PendingIntent: ${e.message}", e)
+                null
+            }
+
+            val deliveryIntent = try {
+                PendingIntent.getBroadcast(
+                    context,
+                    deliveryReqCode,
+                    Intent(context, SmsDeliveryReceiver::class.java).apply {
+                        action = SmsDeliveryReceiver.ACTION_SMS_DELIVERED
+                        putExtra(SmsDeliveryReceiver.EXTRA_SMS_ID, smsId)
+                    },
+                    pendingIntentFlags
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed creating delivery PendingIntent: ${e.message}", e)
+                null
+            }
+
+            // Split message if text exceeds single SMS character limit (multi-part SMS)
+            val parts = try {
+                smsManager.divideMessage(messageText)
+            } catch (e: Exception) {
+                Log.w(TAG, "divideMessage threw exception, falling back to single text: ${e.message}")
+                arrayListOf(messageText)
+            }
+
+            if (parts.isNullOrEmpty()) {
+                return@withContext SmsSendResult.Failure(smsId, "Message text could not be formatted for SMS.")
+            }
+
+            val numParts = parts.size
+            val maskedPhone = if (cleanPhone.length >= 4) "******" + cleanPhone.takeLast(4) else "***"
+            Log.d(TAG, "Dispatching direct SIM SMS for smsId=$smsId to $maskedPhone (parts=$numParts, subId=$subIdToUse)")
+
+            try {
+                if (numParts > 1) {
+                    val sentIntents = ArrayList<PendingIntent?>()
+                    val deliveryIntents = ArrayList<PendingIntent?>()
+                    for (i in 0 until numParts) {
+                        sentIntents.add(sentIntent)
+                        deliveryIntents.add(deliveryIntent)
+                    }
+                    smsManager.sendMultipartTextMessage(
+                        cleanPhone,
+                        null,
+                        parts,
+                        sentIntents,
+                        deliveryIntents
+                    )
+                } else {
+                    smsManager.sendTextMessage(
+                        cleanPhone,
+                        null,
+                        messageText,
+                        sentIntent,
+                        deliveryIntent
+                    )
+                }
+            } catch (se: SecurityException) {
+                Log.e(TAG, "SecurityException sending SMS: ${se.message}", se)
+                return@withContext SmsSendResult.Failure(smsId, "SMS permission was revoked or restricted by system.")
+            } catch (iae: IllegalArgumentException) {
+                Log.e(TAG, "IllegalArgumentException sending SMS: ${iae.message}", iae)
+                return@withContext SmsSendResult.Failure(smsId, "Invalid mobile number or message format: ${iae.message}")
+            } catch (uoe: UnsupportedOperationException) {
+                Log.e(TAG, "UnsupportedOperationException sending SMS: ${uoe.message}", uoe)
+                return@withContext SmsSendResult.Failure(smsId, "Device or carrier does not support direct SIM SMS.")
+            } catch (e: Exception) {
+                Log.e(TAG, "Exception in SmsManager dispatch: ${e.message}", e)
+                return@withContext SmsSendResult.Failure(smsId, "Failed to send SMS: ${e.localizedMessage ?: "Unknown error"}")
+            }
+
+            // Wait for native Android SMS_SENT broadcast callback with safe timeout
+            val sentEvent = withTimeoutOrNull(SMS_SENT_TIMEOUT_MS) {
+                SmsDeliveryReceiver.events
+                    .filter { it.smsId == smsId && it is SmsDeliveryReceiver.SmsEvent.Sent }
+                    .first() as? SmsDeliveryReceiver.SmsEvent.Sent
+            }
+
+            if (sentEvent == null) {
+                Log.w(TAG, "Timeout waiting for SMS_SENT callback for smsId=$smsId, submitted to carrier buffer")
+                return@withContext SmsSendResult.Success(smsId)
+            }
+
+            if (sentEvent.isSuccess) {
+                Log.d(TAG, "SMS confirmed sent by carrier for smsId=$smsId")
+                SmsSendResult.Success(smsId)
+            } else {
+                Log.w(TAG, "SMS sending reported failed by carrier: ${sentEvent.errorReason} (code: ${sentEvent.resultCode})")
+                SmsSendResult.Failure(
+                    smsId = smsId,
+                    reason = sentEvent.errorReason ?: "Carrier rejected SMS transmission",
+                    errorCode = sentEvent.resultCode
                 )
             }
-        } catch (se: SecurityException) {
-            Log.e(TAG, "SecurityException sending SMS: ${se.message}")
-            return@withContext SmsSendResult.Failure(smsId, "SMS Permission revoked by system")
+        } catch (t: Throwable) {
+            Log.e(TAG, "Critical error in sendDirectSms: ${t.message}", t)
+            SmsSendResult.Failure(smsId, "SMS dispatch error: ${t.localizedMessage ?: "Unexpected error"}")
+        }
+    }
+
+    /**
+     * Resolves the proper SmsManager instance across Android 7 to Android 15+.
+     * Validates subscription ID and falls back gracefully to default SmsManager.
+     */
+    private fun resolveSmsManager(subId: Int?): SmsManager? {
+        // 1. Try subscription-specific SmsManager if requested
+        if (subId != null && subId >= 0) {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    val base = context.getSystemService(SmsManager::class.java)
+                    if (base != null) {
+                        return base.createForSubscriptionId(subId)
+                    }
+                }
+                @Suppress("DEPRECATION")
+                val subMgr = SmsManager.getSmsManagerForSubscriptionId(subId)
+                if (subMgr != null) return subMgr
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed resolving SmsManager for subId $subId: ${e.message}, falling back to default")
+            }
+        }
+
+        // 2. Check default SMS subscription if dual SIM
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                val defaultSubId = SubscriptionManager.getDefaultSmsSubscriptionId()
+                if (defaultSubId > 0) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        val base = context.getSystemService(SmsManager::class.java)
+                        if (base != null) {
+                            return base.createForSubscriptionId(defaultSubId)
+                        }
+                    }
+                    @Suppress("DEPRECATION")
+                    val subMgr = SmsManager.getSmsManagerForSubscriptionId(defaultSubId)
+                    if (subMgr != null) return subMgr
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed checking defaultSmsSubscriptionId: ${e.message}")
+            }
+        }
+
+        // 3. Try system service SmsManager (Android 12+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                val sysMgr = context.getSystemService(SmsManager::class.java)
+                if (sysMgr != null) return sysMgr
+            } catch (e: Exception) {
+                Log.w(TAG, "getSystemService(SmsManager) failed: ${e.message}")
+            }
+        }
+
+        // 4. Fallback to SmsManager.getDefault()
+        return try {
+            @Suppress("DEPRECATION")
+            SmsManager.getDefault()
         } catch (e: Exception) {
-            Log.e(TAG, "Exception in SmsManager.sendTextMessage: ${e.message}")
-            return@withContext SmsSendResult.Failure(smsId, "Failed to send SMS: ${e.localizedMessage}")
-        }
-
-        // Wait for actual native Android SMS_SENT broadcast callback
-        val sentEvent = withTimeoutOrNull(SMS_SENT_TIMEOUT_MS) {
-            SmsDeliveryReceiver.events
-                .filter { it.smsId == smsId && it is SmsDeliveryReceiver.SmsEvent.Sent }
-                .first() as? SmsDeliveryReceiver.SmsEvent.Sent
-        }
-
-        if (sentEvent == null) {
-            Log.w(TAG, "Timeout waiting for SMS_SENT callback for smsId=$smsId")
-            // Submitted to system buffer, status remains PENDING in Room until broadcast delivers
-            return@withContext SmsSendResult.Success(smsId)
-        }
-
-        if (sentEvent.isSuccess) {
-            Log.d(TAG, "SMS successfully sent via SIM for smsId=$smsId")
-            SmsSendResult.Success(smsId)
-        } else {
-            Log.w(TAG, "SMS sending failed: ${sentEvent.errorReason} (code: ${sentEvent.resultCode})")
-            SmsSendResult.Failure(
-                smsId = smsId,
-                reason = sentEvent.errorReason ?: "Carrier rejected SMS transmission",
-                errorCode = sentEvent.resultCode
-            )
+            Log.e(TAG, "SmsManager.getDefault() failed: ${e.message}", e)
+            null
         }
     }
 
-    private fun resolveSmsManager(subId: Int?): SmsManager {
-        return if (subId != null && subId >= 0) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val base = context.getSystemService(SmsManager::class.java)
-                base.createForSubscriptionId(subId)
-            } else {
-                @Suppress("DEPRECATION")
-                SmsManager.getSmsManagerForSubscriptionId(subId)
-            }
-        } else {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                context.getSystemService(SmsManager::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                SmsManager.getDefault()
-            }
-        }
-    }
-
-    private fun cleanPhoneNumber(raw: String): String {
+    /**
+     * Cleans phone numbers for domestic SMS dispatch.
+     * Indian mobile numbers are normalized to standard 10 digits for local SMSC routing.
+     */
+    fun cleanPhoneNumber(raw: String): String {
         val trimmed = raw.trim().replace(" ", "").replace("-", "")
-        return if (trimmed.startsWith("+91")) {
-            trimmed
-        } else if (trimmed.length == 10) {
-            "+91$trimmed"
+        return if (trimmed.startsWith("+91") && trimmed.length == 13) {
+            trimmed.substring(3)
+        } else if (trimmed.startsWith("91") && trimmed.length == 12) {
+            trimmed.substring(2)
         } else if (trimmed.startsWith("0") && trimmed.length == 11) {
-            "+91${trimmed.substring(1)}"
+            trimmed.substring(1)
         } else {
             trimmed
         }
     }
 }
-

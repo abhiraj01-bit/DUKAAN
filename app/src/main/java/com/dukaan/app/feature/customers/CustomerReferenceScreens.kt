@@ -111,26 +111,45 @@ class CustomerLedgerViewModel @Inject constructor(
     }
 
     fun sendSmsReminder(customerId: String) {
-        val cust = _customer.value ?: return
+        if (_smsState.value is SmsReminderUiState.Sending) return
+
+        val cust = _customer.value
+        if (cust == null) {
+            _smsState.value = SmsReminderUiState.Error("Customer information is loading. Please try again.")
+            return
+        }
         val phone = cust.phoneNumber?.trim() ?: ""
         if (phone.isBlank()) {
-            _smsState.value = SmsReminderUiState.Error("Customer has no phone number on record")
+            _smsState.value = SmsReminderUiState.Error("Customer has no mobile number on record.")
             return
         }
         if (cust.outstandingPaise <= 0L) {
-            _smsState.value = SmsReminderUiState.Error("Customer has zero balance (?0 udhaar)")
+            _smsState.value = SmsReminderUiState.Error("Customer has zero balance (\u20B90 udhaar). No reminder needed.")
             return
         }
 
         viewModelScope.launch {
-            _smsState.value = SmsReminderUiState.Sending
-            val result = khataSmsRepository.sendManualReminder(customerId)
-            if (result.isSuccess) {
-                _smsState.value = SmsReminderUiState.Success("SMS sent directly to  () via SIM")
-            } else {
-                _smsState.value = SmsReminderUiState.Error(result.exceptionOrNull()?.message ?: "Failed to send SMS")
+            try {
+                _smsState.value = SmsReminderUiState.Sending
+                val result = khataSmsRepository.sendManualReminder(customerId)
+                if (result.isSuccess) {
+                    val formatted = CurrencyFormatter.formatPaise(cust.outstandingPaise)
+                    _smsState.value = SmsReminderUiState.Success("SMS sent directly to ${cust.name} ($phone) for $formatted via SIM")
+                } else {
+                    val errorMsg = result.exceptionOrNull()?.localizedMessage ?: "Failed to send SMS"
+                    _smsState.value = SmsReminderUiState.Error(errorMsg)
+                }
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                android.util.Log.e("CustomerLedgerViewModel", "Exception in sendSmsReminder: ${t.message}", t)
+                _smsState.value = SmsReminderUiState.Error(t.localizedMessage ?: "Unexpected error sending SMS")
             }
         }
+    }
+
+    fun onPermissionDenied() {
+        _smsState.value = SmsReminderUiState.Error("SEND_SMS permission was denied. Please grant SMS permission in device Settings to send reminders directly.")
     }
 
     fun resetSmsState() {
@@ -508,7 +527,7 @@ fun ReferenceCustomerLedgerScreen(
         if (isGranted) {
             viewModel.sendSmsReminder(customerId)
         } else {
-            // Permission denied
+            viewModel.onPermissionDenied()
         }
     }
 
@@ -552,10 +571,14 @@ fun ReferenceCustomerLedgerScreen(
                 },
                 actions = {
                     IconButton(onClick = {
-                        if (ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED) {
-                            viewModel.sendSmsReminder(customerId)
-                        } else {
-                            smsPermissionLauncher.launch(Manifest.permission.SEND_SMS)
+                        try {
+                            if (ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED) {
+                                viewModel.sendSmsReminder(customerId)
+                            } else {
+                                smsPermissionLauncher.launch(Manifest.permission.SEND_SMS)
+                            }
+                        } catch (e: Exception) {
+                            android.util.Log.e("CustomerLedger", "Error in topbar SMS click: ${e.message}", e)
                         }
                     }) {
                         Icon(Icons.Default.Send, contentDescription = "Send SMS Reminder", tint = ForestGreen)
@@ -668,10 +691,14 @@ fun ReferenceCustomerLedgerScreen(
                         // FEATURE 1: Send SMS Reminder Button
                         Button(
                             onClick = {
-                                if (ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED) {
-                                    viewModel.sendSmsReminder(customerId)
-                                } else {
-                                    smsPermissionLauncher.launch(Manifest.permission.SEND_SMS)
+                                try {
+                                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED) {
+                                        viewModel.sendSmsReminder(customerId)
+                                    } else {
+                                        smsPermissionLauncher.launch(Manifest.permission.SEND_SMS)
+                                    }
+                                } catch (e: Exception) {
+                                    android.util.Log.e("CustomerLedger", "Error initiating SMS: ${e.message}", e)
                                 }
                             },
                             enabled = smsState !is SmsReminderUiState.Sending,
