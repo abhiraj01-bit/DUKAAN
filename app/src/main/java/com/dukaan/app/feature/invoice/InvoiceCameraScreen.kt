@@ -11,11 +11,17 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -28,6 +34,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -37,11 +44,14 @@ import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.navigation.NavController
+import com.dukaan.app.core.ai.contracts.InvoiceScanMode
 import com.dukaan.app.core.designsystem.theme.ForestGreen
 import com.dukaan.app.core.designsystem.theme.PrimaryText
 import com.dukaan.app.core.designsystem.theme.SecondaryText
 import com.dukaan.app.core.designsystem.theme.SurfaceWhite
 import com.dukaan.app.core.navigation.Screen
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.util.concurrent.Executors
 
 // =================== SCREEN 12: INVOICE SCANNER (CAMERA) ===================
@@ -103,11 +113,15 @@ private fun CameraCaptureContent(
     val lifecycleOwner = LocalLifecycleOwner.current
     val uiState by viewModel.uiState.collectAsState()
     val isProcessing = viewModel.isProcessing
+    val coroutineScope = rememberCoroutineScope()
 
-    var selectedMode by remember { mutableStateOf("Photo") }
     var flashEnabled by remember { mutableStateOf(false) }
     var cameraControl by remember { mutableStateOf<CameraControl?>(null) }
+    var previewViewRef by remember { mutableStateOf<PreviewView?>(null) }
     var isCapturingPhoto by remember { mutableStateOf(false) }
+
+    // Tap to focus state
+    var focusPoint by remember { mutableStateOf<Offset?>(null) }
 
     val imageCapture = remember {
         ImageCapture.Builder()
@@ -120,7 +134,7 @@ private fun CameraCaptureContent(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
-            viewModel.processGalleryImage(uri, context) { invoiceId ->
+            viewModel.processGalleryImage(uri, context, uiState.selectedScanMode) { invoiceId ->
                 navController.navigate(Screen.ExtractedInvoicePreview.createRoute(invoiceId)) {
                     popUpTo(Screen.InvoiceCamera.route) { inclusive = true }
                 }
@@ -128,12 +142,35 @@ private fun CameraCaptureContent(
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .pointerInput(Unit) {
+                detectTapGestures { offset ->
+                    focusPoint = offset
+                    val pView = previewViewRef
+                    if (pView != null && cameraControl != null) {
+                        val factory = pView.meteringPointFactory
+                        val point = factory.createPoint(offset.x, offset.y)
+                        val action = FocusMeteringAction.Builder(point).build()
+                        cameraControl?.startFocusAndMetering(action)
+                    }
+                    coroutineScope.launch {
+                        delay(1200)
+                        if (focusPoint == offset) {
+                            focusPoint = null
+                        }
+                    }
+                }
+            }
+    ) {
         // Camera Viewfinder Preview
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
                 val previewView = PreviewView(ctx)
+                previewViewRef = previewView
                 val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
                 cameraProviderFuture.addListener({
                     try {
@@ -167,14 +204,14 @@ private fun CameraCaptureContent(
             }
         )
 
-        // Targeting frame overlay (Screen 12 reference visual)
+        // Targeting frame overlay with clear center cutout and white corner reticles
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 32.dp, vertical = 110.dp),
+                .padding(horizontal = 28.dp, vertical = 120.dp),
             contentAlignment = Alignment.Center
         ) {
-            // White corner brackets reticle
+            // White corner brackets reticle (with coordinates bug FIXED at line 198)
             Canvas(modifier = Modifier.fillMaxSize()) {
                 val w = size.width
                 val h = size.height
@@ -182,25 +219,38 @@ private fun CameraCaptureContent(
                 val strokeW = 4.dp.toPx()
                 val cornerColor = Color.White
 
-                // Top-Left
+                // Top-Left Bracket
                 drawLine(cornerColor, Offset(0f, 0f), Offset(cornerLength, 0f), strokeW)
                 drawLine(cornerColor, Offset(0f, 0f), Offset(0f, cornerLength), strokeW)
 
-                // Top-Right
+                // Top-Right Bracket
                 drawLine(cornerColor, Offset(w, 0f), Offset(w - cornerLength, 0f), strokeW)
                 drawLine(cornerColor, Offset(w, 0f), Offset(w, cornerLength), strokeW)
 
-                // Bottom-Left
+                // Bottom-Left Bracket
                 drawLine(cornerColor, Offset(0f, h), Offset(cornerLength, h), strokeW)
                 drawLine(cornerColor, Offset(0f, h), Offset(0f, h - cornerLength), strokeW)
 
-                // Bottom-Right
-                drawLine(cornerColor, Offset(w, h), Offset(w - cornerLength, 0f), strokeW)
+                // Bottom-Right Bracket (FIXED: Offset(w - cornerLength, h) instead of 0f)
+                drawLine(cornerColor, Offset(w, h), Offset(w - cornerLength, h), strokeW)
                 drawLine(cornerColor, Offset(w, h), Offset(w, h - cornerLength), strokeW)
             }
         }
 
-        // Top Control Bar: Back & Flash
+        // Tap-to-focus ring indicator
+        focusPoint?.let { pos ->
+            Box(
+                modifier = Modifier
+                    .offset(
+                        x = (pos.x / LocalContext.current.resources.displayMetrics.density).dp - 28.dp,
+                        y = (pos.y / LocalContext.current.resources.displayMetrics.density).dp - 28.dp
+                    )
+                    .size(56.dp)
+                    .border(2.dp, Color(0xFFF3A342), RoundedCornerShape(8.dp))
+            )
+        }
+
+        // Top Control Bar: Back, AI Mode Badge, and Flash
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -214,9 +264,35 @@ private fun CameraCaptureContent(
                 modifier = Modifier
                     .size(40.dp)
                     .clip(CircleShape)
-                    .background(Color.Black.copy(alpha = 0.4f))
+                    .background(Color.Black.copy(alpha = 0.5f))
             ) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = SurfaceWhite)
+            }
+
+            // On-Device AI Readiness Pill
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = Color.Black.copy(alpha = 0.55f),
+                border = androidx.compose.foundation.BorderStroke(1.dp, ForestGreen.copy(alpha = 0.7f))
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(ForestGreen)
+                    )
+                    Text(
+                        "On-Device AI",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = SurfaceWhite
+                    )
+                }
             }
 
             IconButton(
@@ -227,7 +303,7 @@ private fun CameraCaptureContent(
                 modifier = Modifier
                     .size(40.dp)
                     .clip(CircleShape)
-                    .background(Color.Black.copy(alpha = 0.4f))
+                    .background(Color.Black.copy(alpha = 0.5f))
             ) {
                 Icon(
                     if (flashEnabled) Icons.Default.FlashOn else Icons.Default.FlashOff,
@@ -237,133 +313,146 @@ private fun CameraCaptureContent(
             }
         }
 
-        // Bottom Controls: Shutter Button + Mode Tabs
+        // Bottom Controls: Scan Mode Pills + Shutter Row
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
                 .navigationBarsPadding()
-                .padding(bottom = 28.dp),
+                .padding(bottom = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(20.dp)
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Big Circular Shutter Button with Debounce Protection
-            Box(
+            // Scan Mode Selector Pills (Auto, Handwritten, Printed, Thermal Receipt)
+            Row(
                 modifier = Modifier
-                    .size(80.dp)
-                    .border(4.dp, Color.White, CircleShape)
-                    .padding(5.dp)
-                    .clip(CircleShape)
-                    .background(Color.White)
-                    .clickable(enabled = !isProcessing && !isCapturingPhoto) {
-                        isCapturingPhoto = true
-                        imageCapture.takePicture(
-                            cameraExecutor,
-                            object : ImageCapture.OnImageCapturedCallback() {
-                                override fun onCaptureSuccess(imageProxy: ImageProxy) {
-                                    try {
-                                        val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-                                        val buffer = imageProxy.planes[0].buffer
-                                        val bytes = ByteArray(buffer.remaining())
-                                        buffer.get(bytes)
-                                        imageProxy.close()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                InvoiceScanMode.entries.forEach { mode ->
+                    val isSelected = uiState.selectedScanMode == mode
+                    Surface(
+                        shape = RoundedCornerShape(20.dp),
+                        color = if (isSelected) ForestGreen else Color.Black.copy(alpha = 0.55f),
+                        border = if (isSelected) null else androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.3f)),
+                        modifier = Modifier.clickable { viewModel.setScanMode(mode) }
+                    ) {
+                        Text(
+                            text = mode.displayName,
+                            color = SurfaceWhite,
+                            fontSize = 13.sp,
+                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
+                        )
+                    }
+                }
+            }
 
-                                        var bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                                        if (bitmap != null && rotationDegrees != 0) {
-                                            val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-                                            val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-                                            if (rotated != bitmap) {
-                                                bitmap.recycle()
-                                                bitmap = rotated
-                                            }
-                                        }
+            // Capture Controls Row: Gallery Button (Left) + Big Shutter (Center) + Spacer (Right)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 32.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Gallery shortcut button
+                IconButton(
+                    onClick = { galleryLauncher.launch("image/*") },
+                    modifier = Modifier
+                        .size(52.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.55f))
+                        .border(1.dp, Color.White.copy(alpha = 0.4f), CircleShape)
+                ) {
+                    Icon(
+                        Icons.Default.PhotoLibrary,
+                        contentDescription = "Gallery",
+                        tint = SurfaceWhite,
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
 
-                                        if (bitmap != null) {
-                                            ContextCompat.getMainExecutor(context).execute {
-                                                isCapturingPhoto = false
-                                                viewModel.processCapturedBitmap(bitmap, context) { invoiceId ->
-                                                    navController.navigate(Screen.ExtractedInvoicePreview.createRoute(invoiceId)) {
-                                                        popUpTo(Screen.InvoiceCamera.route) { inclusive = true }
-                                                    }
+                // Primary Shutter Button with Debounce Protection
+                Box(
+                    modifier = Modifier
+                        .size(80.dp)
+                        .border(4.dp, Color.White, CircleShape)
+                        .padding(5.dp)
+                        .clip(CircleShape)
+                        .background(Color.White)
+                        .clickable(enabled = !isProcessing && !isCapturingPhoto) {
+                            isCapturingPhoto = true
+                            imageCapture.takePicture(
+                                cameraExecutor,
+                                object : ImageCapture.OnImageCapturedCallback() {
+                                    override fun onCaptureSuccess(imageProxy: ImageProxy) {
+                                        try {
+                                            val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+                                            val buffer = imageProxy.planes[0].buffer
+                                            val bytes = ByteArray(buffer.remaining())
+                                            buffer.get(bytes)
+                                            imageProxy.close()
+
+                                            var bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                                            if (bitmap != null && rotationDegrees != 0) {
+                                                val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+                                                val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+                                                if (rotated != bitmap) {
+                                                    bitmap.recycle()
+                                                    bitmap = rotated
                                                 }
                                             }
-                                        } else {
+
+                                            if (bitmap != null) {
+                                                ContextCompat.getMainExecutor(context).execute {
+                                                    isCapturingPhoto = false
+                                                    viewModel.processCapturedBitmap(bitmap, context, uiState.selectedScanMode) { invoiceId ->
+                                                        navController.navigate(Screen.ExtractedInvoicePreview.createRoute(invoiceId)) {
+                                                            popUpTo(Screen.InvoiceCamera.route) { inclusive = true }
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                ContextCompat.getMainExecutor(context).execute {
+                                                    isCapturingPhoto = false
+                                                }
+                                            }
+                                        } catch (t: Throwable) {
+                                            try { imageProxy.close() } catch (_: Throwable) {}
+                                            android.util.Log.e("InvoiceCamera", "Error capturing invoice picture", t)
                                             ContextCompat.getMainExecutor(context).execute {
                                                 isCapturingPhoto = false
                                             }
                                         }
-                                    } catch (t: Throwable) {
-                                        try { imageProxy.close() } catch (_: Throwable) {}
-                                        android.util.Log.e("InvoiceCamera", "Error capturing invoice picture", t)
+                                    }
+
+                                    override fun onError(exception: ImageCaptureException) {
+                                        android.util.Log.e("InvoiceCamera", "ImageCaptureException", exception)
                                         ContextCompat.getMainExecutor(context).execute {
                                             isCapturingPhoto = false
                                         }
                                     }
                                 }
-
-                                override fun onError(exception: ImageCaptureException) {
-                                    android.util.Log.e("InvoiceCamera", "ImageCaptureException", exception)
-                                    ContextCompat.getMainExecutor(context).execute {
-                                        isCapturingPhoto = false
-                                    }
-                                }
-                            }
-                        )
-                    },
-                contentAlignment = Alignment.Center
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(62.dp)
-                        .clip(CircleShape)
-                        .background(ForestGreen)
-                )
-            }
-
-            // Photo / Gallery Pill Switcher (Screen 12 reference visual)
-            Row(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(24.dp))
-                    .background(Color.Black.copy(alpha = 0.5f))
-                    .padding(4.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(20.dp))
-                        .background(if (selectedMode == "Photo") Color.White else Color.Transparent)
-                        .clickable { selectedMode = "Photo" }
-                        .padding(horizontal = 20.dp, vertical = 6.dp)
+                            )
+                        },
+                    contentAlignment = Alignment.Center
                 ) {
-                    Text(
-                        "Photo",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 14.sp,
-                        color = if (selectedMode == "Photo") ForestGreen else SurfaceWhite
+                    Box(
+                        modifier = Modifier
+                            .size(62.dp)
+                            .clip(CircleShape)
+                            .background(ForestGreen)
                     )
                 }
 
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(20.dp))
-                        .background(if (selectedMode == "Gallery") Color.White else Color.Transparent)
-                        .clickable {
-                            selectedMode = "Gallery"
-                            galleryLauncher.launch("image/*")
-                        }
-                        .padding(horizontal = 20.dp, vertical = 6.dp)
-                ) {
-                    Text(
-                        "Gallery",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 14.sp,
-                        color = if (selectedMode == "Gallery") ForestGreen else SurfaceWhite
-                    )
-                }
+                // Balance spacer on right for symmetrical layout
+                Box(modifier = Modifier.size(52.dp))
             }
         }
 
-        // Processing Overlay with detailed real-time state (Phase 12)
+        // Processing Overlay with detailed real-time state
         if (isProcessing) {
             Surface(
                 modifier = Modifier.fillMaxSize(),
@@ -383,11 +472,11 @@ private fun CameraCaptureContent(
                             CircularProgressIndicator(color = ForestGreen, strokeWidth = 3.dp)
                             Text(
                                 text = when (val state = uiState.scannerState) {
-                                    is InvoiceScannerState.ProcessingImage -> "Reading your invoice..."
-                                    is InvoiceScannerState.SendingToGemini -> "Connecting to AI (${state.modelName})..."
+                                    is InvoiceScannerState.ProcessingImage -> "Reading your bill..."
+                                    is InvoiceScannerState.SendingToGemini -> "AI Model Active (${state.modelName})..."
                                     is InvoiceScannerState.Retrying -> "Retrying connection (attempt ${state.retryNumber})..."
-                                    is InvoiceScannerState.SwitchingModel -> "Trying another available model..."
-                                    is InvoiceScannerState.ExtractingData -> "Extracting product details..."
+                                    is InvoiceScannerState.SwitchingModel -> "Optimizing AI model..."
+                                    is InvoiceScannerState.ExtractingData -> "Extracting items & totals..."
                                     else -> "Scanning Bill with AI..."
                                 },
                                 fontWeight = FontWeight.Bold,
@@ -409,7 +498,7 @@ private fun CameraCaptureContent(
             }
         }
 
-        // Error Dialog when Scanning Fails (Phase 12 - NEVER silences errors)
+        // Error Dialog when Scanning Fails (NEVER silences errors)
         val errorState = uiState.scannerState as? InvoiceScannerState.Error
         if (errorState != null) {
             AlertDialog(

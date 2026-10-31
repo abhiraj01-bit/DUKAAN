@@ -27,6 +27,9 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.navigation.NavController
+import com.dukaan.app.core.ai.DeviceCapabilityManager
+import com.dukaan.app.core.ai.VlmModelManager
+import com.dukaan.app.core.ai.contracts.ModelStatus
 import com.dukaan.app.core.designsystem.components.*
 import com.dukaan.app.core.designsystem.theme.*
 import com.dukaan.app.core.datastore.DukaanPreferences
@@ -34,6 +37,7 @@ import com.dukaan.app.core.navigation.Screen
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
@@ -93,7 +97,9 @@ class LowStockViewModel @Inject constructor(
 @HiltViewModel
 class SettingsReferenceViewModel @Inject constructor(
     private val preferences: DukaanPreferences,
-    private val shopRepository: ShopRepository
+    private val shopRepository: ShopRepository,
+    private val modelManager: VlmModelManager,
+    private val capabilityManager: DeviceCapabilityManager
 ) : ViewModel() {
     private val _shopProfile = MutableStateFlow<ShopProfile?>(null)
     val shopProfile = _shopProfile.asStateFlow()
@@ -103,6 +109,10 @@ class SettingsReferenceViewModel @Inject constructor(
 
     private val _geminiModel = MutableStateFlow("gemini-1.5-flash")
     val geminiModel = _geminiModel.asStateFlow()
+
+    val vlmStatus = modelManager.status
+    val deviceTotalRamMb = capabilityManager.getTotalRamMb()
+    val isRamCompatible = capabilityManager.hasSufficientTotalRam()
 
     init {
         viewModelScope.launch {
@@ -137,6 +147,22 @@ class SettingsReferenceViewModel @Inject constructor(
             preferences.setGeminiApiKey(key)
             preferences.setGeminiModel(model)
         }
+    }
+
+    fun downloadVlmModel() {
+        viewModelScope.launch {
+            modelManager.downloadModel(requireWifi = false)
+        }
+    }
+
+    fun importVlmModel(uri: Uri) {
+        viewModelScope.launch {
+            modelManager.importModelFile(uri)
+        }
+    }
+
+    fun deleteVlmModel() {
+        modelManager.deleteModel()
     }
 }
 
@@ -300,6 +326,16 @@ fun ReferenceSettingsScreen(
     val geminiKey by viewModel.geminiKey.collectAsState()
     val geminiModel by viewModel.geminiModel.collectAsState()
     var showGeminiDialog by remember { mutableStateOf(false) }
+    var showVlmDialog by remember { mutableStateOf(false) }
+    val vlmStatus by viewModel.vlmStatus.collectAsState()
+
+    val modelPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.importVlmModel(uri)
+        }
+    }
     var showMonthlySmsDialog by remember { mutableStateOf(false) }
     val autoMonthlySms by viewModel.autoMonthlySms.collectAsState(initial = false)
     val nextMonthlySmsDate by viewModel.nextMonthlySmsDate.collectAsState(initial = 0L)
@@ -396,6 +432,19 @@ fun ReferenceSettingsScreen(
                             title = "AI Bill Scanner (Gemini)",
                             badge = if (geminiKey.isNotBlank()) "Configured" else "Setup API Key",
                             onClick = { showGeminiDialog = true }
+                        )
+                        HorizontalDivider(color = BorderColor.copy(alpha = 0.5f), modifier = Modifier.padding(horizontal = 16.dp))
+
+                        ReferenceSettingsRow(
+                            icon = Icons.Default.Memory,
+                            title = "On-Device AI (Gemma 3n)",
+                            badge = when (vlmStatus) {
+                                is ModelStatus.Loaded -> "Active"
+                                is ModelStatus.Downloaded -> "Ready"
+                                is ModelStatus.Downloading -> "Downloading..."
+                                else -> if (viewModel.isRamCompatible) "Available" else "ML Kit Baseline"
+                            },
+                            onClick = { showVlmDialog = true }
                         )
                         HorizontalDivider(color = BorderColor.copy(alpha = 0.5f), modifier = Modifier.padding(horizontal = 16.dp))
 
@@ -596,6 +645,78 @@ fun ReferenceSettingsScreen(
             dismissButton = {
                 TextButton(onClick = { showGeminiDialog = false }) {
                     Text("Cancel")
+                }
+            }
+        )
+    }
+
+    if (showVlmDialog) {
+        AlertDialog(
+            onDismissRequest = { showVlmDialog = false },
+            title = { Text("On-Device AI (Gemma 3n)", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        "DukaanAI includes bundled zero-download ML Kit (English + Hindi) which operates 100% offline. You can also download Gemma 3n for advanced handwritten and printed reasoning.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = SecondaryText
+                    )
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = WarmCream),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("Device RAM: ${viewModel.deviceTotalRamMb} MB", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                            Text(
+                                if (viewModel.isRamCompatible) "✓ Compatible (>= 4 GB RAM)" else "⚠ Low RAM (< 4 GB). ML Kit offline OCR is recommended.",
+                                fontSize = 12.sp,
+                                color = if (viewModel.isRamCompatible) ForestGreen else Color(0xFFC04B37)
+                            )
+                            Text(
+                                text = when (val s = vlmStatus) {
+                                    is ModelStatus.Loaded -> "Status: Loaded in Memory (Active)"
+                                    is ModelStatus.Downloaded -> "Status: Downloaded & Ready"
+                                    is ModelStatus.Downloading -> "Status: Downloading (${s.progressPercent}%)"
+                                    is ModelStatus.Failed -> "Status: Error (${s.reason})"
+                                    else -> "Status: Not Downloaded (Using bundled ML Kit)"
+                                },
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                if (vlmStatus is ModelStatus.Downloaded || vlmStatus is ModelStatus.Loaded) {
+                    Button(
+                        onClick = {
+                            viewModel.deleteVlmModel()
+                            showVlmDialog = false
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC04B37))
+                    ) {
+                        Text("Delete Model")
+                    }
+                } else if (vlmStatus is ModelStatus.Downloading) {
+                    TextButton(enabled = false, onClick = {}) {
+                        Text("Importing Model...")
+                    }
+                } else {
+                    Button(
+                        onClick = {
+                            modelPickerLauncher.launch(arrayOf("*/*"))
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = ForestGreen),
+                        enabled = viewModel.isRamCompatible
+                    ) {
+                        Text("Select .task File")
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showVlmDialog = false }) {
+                    Text("Close")
                 }
             }
         )

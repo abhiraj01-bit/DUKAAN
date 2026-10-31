@@ -28,6 +28,8 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.navigation.NavController
+import com.dukaan.app.core.ai.InvoiceOcrPipeline
+import com.dukaan.app.core.ai.contracts.InvoiceScanMode
 import com.dukaan.app.core.designsystem.components.*
 import com.dukaan.app.core.designsystem.theme.*
 import com.dukaan.app.core.navigation.Screen
@@ -70,13 +72,15 @@ data class ScannerUiState(
     val pendingInvoices: List<Invoice> = emptyList(),
     val lastBitmap: Bitmap? = null,
     val lastContext: Context? = null,
-    val lastInvoiceId: String = ""
+    val lastInvoiceId: String = "",
+    val selectedScanMode: InvoiceScanMode = InvoiceScanMode.AUTO
 )
 
 @HiltViewModel
 class InvoiceScannerViewModel @Inject constructor(
     private val invoiceRepository: InvoiceRepository,
-    private val geminiInvoiceService: GeminiInvoiceService
+    private val geminiInvoiceService: GeminiInvoiceService,
+    private val ocrPipeline: InvoiceOcrPipeline
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(ScannerUiState())
@@ -102,16 +106,26 @@ class InvoiceScannerViewModel @Inject constructor(
         }
     }
 
+    fun setScanMode(mode: InvoiceScanMode) {
+        _uiState.update { it.copy(selectedScanMode = mode) }
+    }
+
     /**
      * Entry point for camera captures. Cancels any ongoing scan to prevent duplicate calls.
      */
-    fun processCapturedBitmap(bitmap: Bitmap, context: Context, onReady: (String) -> Unit) {
+    fun processCapturedBitmap(
+        bitmap: Bitmap,
+        context: Context,
+        scanMode: InvoiceScanMode = _uiState.value.selectedScanMode,
+        onReady: (String) -> Unit
+    ) {
         val invoiceId = UuidGenerator.generate()
         _uiState.update {
             it.copy(
                 lastBitmap = bitmap,
                 lastContext = context,
-                lastInvoiceId = invoiceId
+                lastInvoiceId = invoiceId,
+                selectedScanMode = scanMode
             )
         }
         startScan(bitmap, context, invoiceId, onReady)
@@ -120,7 +134,12 @@ class InvoiceScannerViewModel @Inject constructor(
     /**
      * Entry point for gallery images. Safely decodes uri with bounds checking.
      */
-    fun processGalleryImage(uri: Uri, context: Context, onReady: (String) -> Unit) {
+    fun processGalleryImage(
+        uri: Uri,
+        context: Context,
+        scanMode: InvoiceScanMode = _uiState.value.selectedScanMode,
+        onReady: (String) -> Unit
+    ) {
         scanJob?.cancel()
         scanJob = viewModelScope.launch {
             _uiState.update { it.copy(scannerState = InvoiceScannerState.ProcessingImage) }
@@ -241,6 +260,38 @@ class InvoiceScannerViewModel @Inject constructor(
             _uiState.update { it.copy(scannerState = InvoiceScannerState.ProcessingImage) }
 
             try {
+                val scanMode = _uiState.value.selectedScanMode
+
+                // PRIMARY PATH — On-device AI pipeline (ML Kit baseline, Gemma 3n when downloaded).
+                // Falls back to Gemini path automatically if the pipeline itself throws.
+                val pipelineResult = ocrPipeline.processInvoice(
+                    bitmap = bitmap,
+                    invoiceId = invoiceId,
+                    scanMode = scanMode,
+                    onStatusUpdate = null // UI already shows ProcessingImage state
+                )
+
+                if (pipelineResult.isSuccess) {
+                    val response = pipelineResult.getOrThrow()
+                    // Invoice already saved to Room inside InvoiceOcrPipeline.processInvoice.
+                    val savedInvoice = invoiceRepository.getInvoiceById(invoiceId)
+                    if (savedInvoice != null) {
+                        _uiState.update {
+                            it.copy(
+                                scannerState = InvoiceScannerState.Success(
+                                    invoice = savedInvoice,
+                                    modelUsed = response.modelId,
+                                    extractionSource = com.dukaan.app.core.ocr.ExtractionSource.LOCAL_OCR
+                                )
+                            )
+                        }
+                        onReady(invoiceId)
+                        return@launch
+                    }
+                    // If we can't read back the invoice (shouldn't happen), fall through to Gemini.
+                }
+
+                // FALLBACK — Gemini cloud path (preserves all existing retry/model-switch logic).
                 val result = geminiInvoiceService.processInvoiceImage(
                     context = context,
                     bitmap = bitmap,
